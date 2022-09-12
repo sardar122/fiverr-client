@@ -1,0 +1,147 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+    This template deploys a single fargate service.
+    Last Update:
+      2022.05.31
+
+Parameters:
+  Application:
+    Type: String
+    Description: The Application tag is used to designate the application of the associated AWS resource. In this capacity application does not refer to an installed software component, but rather the overall business application that the resource supports.
+    Default: myunity
+  ResourceName:
+    Type: String
+  CostCenter:
+    Type: String
+  Environment:
+    Type: String
+    Description: The environment tag (e.g. dev, qa, prod, etc.) is used to designate the Environment Stage of the associated AWS resource.
+  ResourceType:
+    Type: String
+    AllowedValues:
+      - Application
+      - "Shared Service"
+      - "Support System"
+    Default: Application
+  ClusterNameParameter: 
+    Description: "Cluster name"
+    Type: String
+  ClusterSecurityGroupParameter:
+    Description: The cluster sg
+    Type: List<AWS::EC2::SecurityGroup::Id>
+  SubnetsParameter:
+    Description: "Attached subnets"
+    Type: "List<AWS::EC2::Subnet::Id>"
+  StackIDParameter: 
+    Description: "Environment stack. i.e. t1, t2, s1, s2, p1, p2, ..."
+    Type: String
+  ServiceNameParameter: 
+    Description: "Name of Service"
+    Type: String
+  MaximumPercentParameter:
+    Description: "Maximum health percent during deployment"
+    Type: Number
+    Default: 100
+    MinValue: 100
+  MinimumHealthyPercentParameter:
+    Description: "Minimum health percent during deployment"
+    Type: Number
+    Default: 0
+  DesiredCountParameter:
+    Description: "Initial number of task instances of this service"
+    Type: Number
+    Default: 0
+  MinTasksParameter:
+    Description: The minimum value that you plan to scale in to
+    Type: Number
+    Default: 0
+  MaxTasksParameter:
+    Description: The maximum value that you plan to scale out to
+    Type: Number
+    Default: 0
+  TargetCPUPercentParameter:
+    Description: Target CPU utilization percentage level
+    Type: Number
+    Default: 70.0
+  ScaleInCooldownParameter:
+    Description: The amount of time, in seconds, after a scale-in activity completes before another scale-in activity can start
+    Type: Number
+    Default: 600
+  ScaleOutCooldownParameter:
+    Description: The amount of time, in seconds, to wait for a previous scale-out activity to take effect
+    Type: Number
+    Default: 300
+
+Mappings:
+  CloudFormation:
+    Architecture:
+      Version: 1.0
+    MigrationAssistanceProgram:
+      ServerId: d-server-02bezuej0o1ftf
+
+Resources:
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Join [ "-", [ !Ref ServiceNameParameter, "service"] ]
+      Cluster: !Ref ClusterNameParameter
+      LaunchType: FARGATE
+      DeploymentConfiguration: # No blue green for services
+        MaximumPercent: !Ref MaximumPercentParameter
+        MinimumHealthyPercent: !Ref MinimumHealthyPercentParameter
+      DesiredCount: !Ref DesiredCountParameter
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups: !Ref ClusterSecurityGroupParameter
+          Subnets: !Ref SubnetsParameter
+      TaskDefinition: !Join [ "-", [ !Ref StackIDParameter, !Ref ServiceNameParameter, "task-definition"] ]
+      Tags:
+        - Key: Name
+          Value: !Join ["-", [!Ref Application, !Ref Environment, !Ref ResourceName]]
+        - Key: Application
+          Value: !Ref Application
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Type
+          Value: !Ref ResourceType
+        - Key: ArchitectureVersion
+          Value: !FindInMap [CloudFormation, Architecture, Version]
+        - Key: map-migrated
+          Value: !FindInMap [CloudFormation, MigrationAssistanceProgram, ServerId]
+
+  ServiceScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: !Ref MinTasksParameter
+      MaxCapacity: !Ref MaxTasksParameter
+      ResourceId: !Join
+        - /
+        - - service
+          - !Ref ClusterNameParameter
+          - !GetAtt Service.Name
+      RoleARN: 
+        Fn::Sub: 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService'
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  ServiceScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: ServiceScalingPolicyByAverageCPUUtilization
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ServiceScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: !Ref TargetCPUPercentParameter
+        ScaleInCooldown: !Ref ScaleInCooldownParameter
+        ScaleOutCooldown: !Ref ScaleOutCooldownParameter
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+
+Outputs:  
+  ServiceName:
+    Value: !Join [ "-", [ !Ref ServiceNameParameter, "service"] ]
+  TaskDefinition:
+    Value: !Join [ "-", [ !Ref StackIDParameter, !Ref ServiceNameParameter, "task-definition"] ]

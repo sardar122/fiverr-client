@@ -1,0 +1,75 @@
+#!/usr/bin/env groovy
+if (env.JENKINS_URL.contains('myunity-bo-prod-jenkins')) {
+    cost_center  = "2016 Hosting - Post Acute"
+}
+else if (env.JENKINS_URL.contains('myunity-bo-test-jenkins')){
+    cost_center  = "5027 RD - myUnity Homecare and Hospice"
+}
+else{
+    error("Unknown Jenkins instance... Exiting")
+}
+
+def checkoutService(gitRepo, gitBranch) {
+    //bitbucket account id from jenkins
+    echo "Pulling source repo: ${gitRepo}"
+    echo "Branch: ${gitBranch}"
+    def git_credentials_id = "bitbucket_bbcloudapi"
+    def gitBranchParameter = "${gitBranch}".toString()
+    checkout([$class: 'GitSCM',
+          branches: [[name: "${gitBranchParameter}"]],
+          doGenerateSubmoduleConfigurations: false,
+          submoduleCfg: [],
+          userRemoteConfigs: [[url: "https://bitbucket.org/ntsttech/${gitRepo}.git", credentialsId: "${git_credentials_id}"]],
+    ])
+}
+
+node(label: 'msbuild'){
+    def workspace = "${env.WORKSPACE}"
+    def cfn_repo = "${workspace}\\cloud_team"
+
+    // checkout from git
+    stage("checkout-tools"){
+        dir("${cfn_repo}"){
+            checkoutService("mubo-devops", scm.branches[0].name)
+        }
+    }
+
+    stage("validation"){
+        if(("${Region}" == "us-east-2") && ("${AvailabilityZone}" == "d")){
+            error("Region us-east-2 does not have availability zone 'd'. Exiting pipeline.")
+        }
+        if("${HostNumber}" == ""){
+            error("HostNumber must not be null. Exiting pipeline.")
+        }
+        if("${HostNumber.isNumber()}" == "false"){
+            error("Value entered for HostNumber is not a number. Exiting pipeline.")
+        }
+        HostNumber = HostNumber.padLeft(2,"0")
+        dedicated_host_stack_name = "ppmuemdb${HostNumber}-${Region}${AvailabilityZone}"
+        //TODO Script to see if above stack name is a stack that exists?
+    }
+
+    stage("deploy-dedicated-host"){
+        dir("${cfn_repo}"){
+            powershell """\
+                aws cloudformation deploy `
+                --no-fail-on-empty-changeset `
+                --stack-name \"${dedicated_host_stack_name}\" `
+                --template-file \"cloudformation\\40-Compute\\ec2-dedicated-host.yaml\" `
+                --capabilities CAPABILITY_IAM `
+                --region ${Region} `
+                --parameter-overrides `
+                \"AvailabilityZone=${Region}${AvailabilityZone}\" `
+                \"InstanceType=r5.xlarge\"""".stripIndent()
+
+            host_id = bat (script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} ${dedicated_host_stack_name} DedicatedHostId",returnStdout: true).trim()
+            // Modify the Dedicated Host to allow different instance sizes
+            powershell "aws ec2 modify-hosts --host-ids ${host_id} --instance-family r5"
+            // Add Tags to Dedicated Host as they're not supported in CloudFormation at this time
+            powershell "aws ec2 create-tags --resources ${host_id} --tags Key=Name,Value='${dedicated_host_stack_name}'"
+            powershell "aws ec2 create-tags --resources ${host_id} --tags Key=CostCenter,Value='${cost_center}'"
+            powershell "aws ec2 create-tags --resources ${host_id} --tags Key=map-migrated,Value='d-server-02bezuej0o1ftf'"
+            powershell "aws ec2 create-tags --resources ${host_id} --tags Key=ArchitectureVersion,Value='1.0'"
+        }
+    }
+}

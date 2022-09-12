@@ -1,0 +1,388 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  EC2 - Basic Linux
+  Last Updated:
+    PYD-CFN | 20220418 | A basic Amazon Linux EC2 instance
+
+Parameters:
+  AccountFamily:
+    Type: String
+    Description: The name of the Account.
+    Default: myunity
+
+  Application:
+    Type: String
+    Description: The name of the Application.
+
+  Environment:
+    Type: String
+    Description: The type of the environment (e.g. dev, qa, prod, etc.). This value will be appended as a suffix to the stack resources.
+
+  InstanceType:
+    Type: String
+    Default: t3a.nano
+    Description: The type of compute instance
+
+  InstanceId:
+    Description: Unique identifier to append to EC2 instance name for identification
+    Type: String
+    Default: 0
+
+  KeyName:
+    Description: Name of an existing EC2 KeyPair
+    Type: "AWS::EC2::KeyPair::KeyName"
+    ConstraintDescription: Can contain only ASCII characters.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+
+  PrivateIpAddress:
+    Type: String
+    Description: Static IP address to assign to the EC2 instance. The address must be in the chosen SubnetId.
+    Default: 10.67.65.100
+
+  CostCenter:
+    Default: '0350 Hosting - Plexus Cloud'
+    Type: String
+
+  Client:
+    Default: ''
+    Type: String
+
+  ClientId:
+    Default: ''
+    Type: String
+
+  ResourceName:
+    Type: String
+    Default: ''
+
+  ResourceType:
+    Type: String
+    AllowedValues:
+      - Application
+      - "Shared Service"
+      - "Support System"
+    Default: "Support System"
+
+  ImageId:
+    Description: Select the image
+    Type: String
+    Default: ami-0fe23c115c3ba9bac
+
+  AWSBackupRetention:
+    Type: String
+    AllowedValues:
+      - none
+      - 5days
+      - 14days
+      - Full
+    Default: Full
+
+  AutomaticPatches:
+    Type: String
+    AllowedValues:
+      - general-prod
+      - general-dev
+
+  PatchGroup:
+    Type: String
+    AllowedValues:
+      - general-amazonlinux2-prod
+      - general-amazonlinux2-dev
+
+  BaseDriveSize:
+    Type: Number
+    Default: 30
+    Description: Size in GB of base drive size
+
+  # Monitoring Tags
+  Function:
+    Description: Monitoring tag for EC2 instance function
+    Type: String
+
+  JenkinsAccess:
+    Type: String
+    AllowedValues:
+      - true
+      - false
+    Default: false
+    Description: Whether or not the main Jenkins host is deployed in this region
+
+  JenkinsSg:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Allow access to Ansible from this Jenkins Security Group, usually *-mgmt-jenkins-ecs-service-ServiceSecurityGroup (Export *-mgmt-jenkins-ContainerAccess)
+
+  BastionSg:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Allow access to Ansible from this Bastion Security Group
+
+  S3NonProdDatabaseBackupArn:
+    Type: String
+
+  S3ProdDatabaseBackupArn:
+    Type: String
+
+Mappings:
+  CloudFormation:
+    Architecture:
+      Version: 1.0
+    MigrationAssistanceProgram:
+      ServerId: d-server-02bezuej0o1ftf
+
+Conditions:
+  FirstBuild: !Equals [!Ref InstanceId, 0]
+  Jenkins: !Equals [!Ref JenkinsAccess, true]
+  FirstBuildAndJenkins: !And
+  - !Condition FirstBuild
+  - !Condition Jenkins
+
+Resources:
+  Ec2SecurityGroup:
+    Condition: FirstBuild
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Access to the Ansible EC2 host"
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value:
+            !Join ["-", [!Ref AccountFamily, !Ref Environment, !Ref Application, SG]]
+        - Key: Application
+          Value: !Ref Application
+        - Key: ArchitectureVersion
+          Value: !FindInMap [CloudFormation, Architecture, Version]
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: map-migrated
+          Value: !FindInMap [CloudFormation, MigrationAssistanceProgram, ServerId]
+        - Key: ResourceType
+          Value: !Ref ResourceType
+        - Key: Client
+          Value: !Ref Client
+  BastionSecurityGroupRule0:
+    Condition: FirstBuild
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref Ec2SecurityGroup
+      IpProtocol: 'tcp'
+      FromPort: 22
+      ToPort: 22
+      SourceSecurityGroupId: !Ref BastionSg
+  JenkinsWindowsSecurityGroupRule0:
+    Condition: FirstBuildAndJenkins
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref Ec2SecurityGroup
+      IpProtocol: 'tcp'
+      FromPort: 4243
+      ToPort: 4243
+      SourceSecurityGroupId: !Ref JenkinsSg
+  JenkinsWindowsSecurityGroupRule1:
+    Condition: FirstBuildAndJenkins
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref Ec2SecurityGroup
+      IpProtocol: 'tcp'
+      FromPort: 32678
+      ToPort: 60999
+      SourceSecurityGroupId: !Ref JenkinsSg
+  IamRole:
+    Condition: FirstBuild
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+              - ec2.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Path: /
+      Policies:
+        - PolicyName: s3-bucket-access
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${AWS::AccountId}-myunity-bo-released-packages
+                  - !Sub arn:aws:s3:::${AWS::AccountId}-myunity-bo-released-packages/*
+                  - !Sub arn:aws:s3:::${AWS::AccountId}-packages
+                  - !Sub arn:aws:s3:::${AWS::AccountId}-packages/*
+                  - !Sub arn:aws:s3:::${AWS::AccountId}-scripts
+                  - !Sub arn:aws:s3:::${AWS::AccountId}-scripts/*
+                  - !Sub "${S3ProdDatabaseBackupArn}/*"
+                  - !Sub "${S3ProdDatabaseBackupArn}"
+                  - !Sub "${S3NonProdDatabaseBackupArn}/*"
+                  - !Sub "${S3NonProdDatabaseBackupArn}"
+        - PolicyName: cloudwatch-logging-monitoring
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+                - cloudwatch:PutMetricData
+                - ec2:DescribeTags
+                - ec2:DescribeVolumes
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:DescribeLogGroups
+                - logs:DescribeLogStreams
+                - logs:PutLogEvents
+              Resource: '*'
+        - PolicyName: ssm-access
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:DescribeParameters
+                  - ssm:PutParameter
+                Resource: '*'
+        - PolicyName: directory-service-access
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ds:Describe*
+                Resource: '*'
+        - PolicyName: elastic-beanstalk-access
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticbeanstalk:DescribeEnvironments
+                  - elasticbeanstalk:DescribeApplications
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Join ["-", [!Ref AccountFamily, !Ref Environment, !Ref Application, !Ref InstanceId]]
+        - Key: Application
+          Value: !Ref Application
+        - Key: ArchitectureVersion
+          Value: !FindInMap [CloudFormation, Architecture, Version]
+        - Key: Client
+          Value: !Ref Client
+        - Key: ClientId
+          Value: !Ref ClientId
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: map-migrated
+          Value: !FindInMap [CloudFormation, MigrationAssistanceProgram, ServerId]
+        - Key: ResourceType
+          Value: !Ref ResourceType
+
+  Ec2InstanceProfile:
+    Condition: FirstBuild
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref IamRole
+
+  RawEc2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      BlockDeviceMappings:
+        -
+          DeviceName: xvdh
+          Ebs:
+            VolumeSize: !Ref BaseDriveSize
+            VolumeType: gp3
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      Monitoring: true
+      PrivateIpAddress: !Ref PrivateIpAddress
+      SecurityGroupIds:
+        - !Ref Ec2SecurityGroup
+      SubnetId: !Ref SubnetId
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      Tags:
+          - Key: Name
+            Value: !Ref ResourceName
+          - Key: Application
+            Value: !Ref Application
+          - Key: ArchitectureVersion
+            Value: !FindInMap [CloudFormation, Architecture, Version]
+          - Key: Client
+            Value: !Ref Client
+          - Key: ClientId
+            Value: !Ref ClientId
+          - Key: CostCenter
+            Value: !Ref CostCenter
+          - Key: Environment
+            Value: !Ref Environment
+          - Key: ResourceType
+            Value: !Ref ResourceType
+          - Key: map-migrated
+            Value: !FindInMap [CloudFormation, MigrationAssistanceProgram, ServerId]
+          - Key: AWSBackup
+            Value: !Sub 'EC2-${AWSBackupRetention}'
+          - Key: automatic-patches
+            Value: !Ref AutomaticPatches
+          - Key: 'Patch Group'
+            Value: !Ref PatchGroup
+          - Key: Function
+            Value: !Ref Function
+      UserData:
+        Fn::Base64: !Sub |+
+          #!/bin/bash -x
+          yum update -y
+          yum -y install git python3-pip yum-cron jq
+          sed -i 's/apply_updates = no/apply_updates = yes/g' /etc/yum/yum-cron.conf
+          chkconfig yum-cron on
+          systemctl start yum-cron
+          # Setup for docker
+          yum install docker -y
+          systemctl start docker
+          iptables -A INPUT -p tcp --dport 32678:60999 -j ACCEPT
+          iptables -A INPUT -p tcp --dport 4243 -j ACCEPT
+          systemctl stop docker
+          sed -i 's/\-H fd:\/\//-H tcp:\/\/0\.0\.0\.0:4243 -H unix:\/\/\/var\/run\/docker\.sock/g' "/lib/systemd/system/docker.service"
+          systemctl daemon-reload
+          systemctl enable docker.service
+          systemctl start docker.service
+          # Provision Bitbucket access
+          mkdir -p /ntst/.ssh/
+          echo "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCse2syikjHgxaPSgni0EuBSn8OZdbiVwEArTiwQVXeTU6qoCGgF8s0cyLkeo+fgZ6Vt/NE0M5zBo9Mo11j1mTTUj5nh4oY0AtfcjGvGjzhrmylHDRWhx1d+PFBCkq+P5TwOm26s8y5BNdzRl/0H7xNFVV4iwkZxrFWh8C+2Sd8VSB9sRpBz/1wwex2zJFHcveyva0hiZ60IzDSveAhAV2vnXQNoCLm5nO1ADauHGVqIWnCha3djZ5Db4x085GW5WZwSU3aeuWAGYigfRFAXSp57+0vd5M1H/Gf0mCuFxFSOGcXUnHrSyJ/vjp2fGpTDlkz++Hci4TkWB7sDxPeZRxp" > /root/.ssh/bitbucket_rsa.pub
+          aws s3 cp s3://${AWS::AccountId}-scripts/keys/bitbucket_rsa /root/.ssh/
+          aws s3 cp s3://${AWS::AccountId}-scripts/keys/known_hosts /root/.ssh/
+          aws s3 cp s3://${AWS::AccountId}-scripts/keys/jenkins.secret /root/
+          aws s3 cp s3://${AWS::AccountId}-scripts/keys/ansible_private.pem /root/
+          chmod 600 /root/.ssh/bitbucket_rsa
+          chmod 600 /root/ansible_private.pem
+          chown root:root /root/.ssh/bitbucket_rsa
+          chown root:root /root/ansible_private.pem
+          eval $(ssh-agent)
+          ssh-add /root/.ssh/bitbucket_rsa
+          # Clone npc_automation repo to create Jenkins-Ansible Images
+          cd ~
+          git clone git@bitbucket.org:ntsttech/npc_automation.git --single-branch --branch JenkinsWorker
+          chmod -R u+x  npc_automation/JenkinsWorker/scripts
+          cd npc_automation/JenkinsWorker/
+          ./scripts/aws-create-jenkins-node-image.sh
+          ./scripts/aws-create-jenkible-image.sh -a 2.9 -u root -p 3.7 -i jenkins-node
+
+Outputs:
+  Ec2Instance:
+    Value: !Ref RawEc2Instance
+  Ec2PrivateIP:
+    Value: !GetAtt RawEc2Instance.PrivateIp
+  Ec2AvailabilityZone:
+    Value: !GetAtt RawEc2Instance.AvailabilityZone
+  AnsibleSG:
+    Value: !Ref Ec2SecurityGroup
+  AnsibleEc2InstanceProfile:
+    Value: !Ref Ec2InstanceProfile

@@ -1,0 +1,225 @@
+import groovy.json.JsonSlurper
+
+web_bootstrapper = "ebs-web-bootstrapper_${Target_Version}.zip"
+web_app = "ebs-web-app_${Target_Version}.zip"
+db_upgrade = "dbupgrade_${Target_Version}.zip"
+crm_filewatcher = "crm-filewatcher_${Target_Version}.zip"
+versionJsonFileName = "version_info.json"
+
+def imgs = [
+    guardiant: 'myunity-bo-svc-guardiant_collector',
+    hl7: 'myunity-bo-svc-hl7',
+    inbound: 'myunity-bo-svc-interop_inbound',
+    outbound: 'myunity-bo-svc-interop_outbound',
+    jobSchedular: 'myunity-bo-svc-job_scheduler',
+    remcomm: 'myunity-bo-svc-remote_comm_agent',
+    telephony: 'myunity-bo-svc-telephony',
+    workflow: 'myunity-bo-svc-workflow',
+    offlineMtf: 'myunity-bo-svc-offline_mtf'
+    //audit: 'myunity-bo-svc-audit',
+    //filebeat: 'myunity-bo-svc-filebeat'
+]
+
+def checkoutService(gitRepo, gitBranch) {
+    //bitbucket account id from jenkins
+    def git_credentials_id = "bitbucket_bbcloudapi"
+    def gitBranchParameter = "${gitBranch}".toString()
+    checkout([$class: 'GitSCM',
+          branches: [[name: "${gitBranchParameter}"]],
+          doGenerateSubmoduleConfigurations: false,
+          submoduleCfg: [],
+          userRemoteConfigs: [[url: "https://bitbucket.org/ntsttech/${gitRepo}.git", credentialsId: "${git_credentials_id}"]],
+         ])
+}
+
+def getArtifactsFromS3(tfsBranch, sourceVersion, targetVersion, s3Bucket, localFolder, scriptName) {
+    //This will download the zip(s) from the S3 location.
+    powershell(returnStdout: true, script: """
+        Using module \"${ENV:WORKSPACE}\\Powershell\\mubo_core.psm1\";
+        
+        function Invoke-GetArtifacts {
+            & (Get-ScriptDirectory -PostPath \"${ENV:WORKSPACE}\\Powershell\\""" + scriptName + """\") `
+                -TFSBranch \"""" + tfsBranch + """\" -SourceVersion \"""" + sourceVersion + """\" -TargetVersion \"""" + targetVersion + """\" -S3Bucket \"""" + s3Bucket + """\" -LocalFolder \"""" + localFolder + """\";
+        }
+        
+        function Main {
+            Invoke-GetArtifacts;
+        }
+        
+        Main
+     """)
+}
+
+def updateVersionInfoFile(bootstrapper, buildName, targetVersion) {
+    //this will unzip the bootstrapper, update the verion_info.json and zip again.
+    def zipDestinationDir = 'bootstrapper_unzipped'
+    def versionInfoFilePath = "${zipDestinationDir}\\${versionJsonFileName}"
+
+    unzip dir: zipDestinationDir, glob: '', zipFile: bootstrapper
+
+    //get json 
+    def versionInfo = readJSON file: versionInfoFilePath
+
+    //overwrite the file with the new information
+    powershell(returnStdout: true, script: """
+            Powershell\\create-version-info-file.ps1 -build_name "${buildName}" -build_number "${targetVersion}" -crm "${versionInfo.crm}" -myUnity_bo_help "${versionInfo.myUnity_bo_help}" -version_file_destination "${zipDestinationDir}"
+    """)
+
+    zip archive: false, dir: zipDestinationDir, glob: '', zipFile: bootstrapper, overwrite: true
+}
+
+def cleanUpArtifacts(localFolder, scriptName) {
+    //Tis will go delete the files from the Jenkins Node
+    powershell(returnStdout: true, script: """
+        Using module \"${ENV:WORKSPACE}\\Powershell\\mubo_core.psm1\";
+        
+        function Invoke-CleanUpArtifacts {
+            & (Get-ScriptDirectory -PostPath \"${ENV:WORKSPACE}\\Powershell\\""" + scriptName + """\") `
+                -LocalFolder \"""" + localFolder + """\";
+        }
+        
+        function Main {
+            Invoke-CleanUpArtifacts;
+        }
+        
+        Main
+     """)
+}
+
+pipeline {
+    agent none
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '1'))
+    }
+    
+    stages {
+    
+        stage('clean-workspace') {
+            agent {label 'msbuild'}
+            steps {
+                // Clean before build
+                cleanWs()
+            }
+        }
+        stage('checkout-source-code') {
+            agent {label 'msbuild'}
+            // checkout from git
+            steps {
+                checkoutService("${git_repo}","${git_branch}")
+            }
+        }
+        stage('get-artifacts') {
+            agent {label 'msbuild'}
+            steps {
+                getArtifactsFromS3("${TFS_Branch}","${Source_Version}","${Target_Version}","${S3_Bucket}", "${ENV:WORKSPACE}\\ntst-artifactory-promote-web", "get-mubo-core-zips-from-s3.ps1")         
+            }
+        }
+        stage('update-version-file') {
+            agent {label 'msbuild'}
+            steps {
+                updateVersionInfoFile("${ENV:WORKSPACE}\\ntst-artifactory-promote-web\\${web_bootstrapper}", "${TFS_Branch}","${Target_Version}");
+            }
+        }
+        stage('get-images') {
+            agent {label 'Linux'}
+            steps {
+                script {
+
+                    String tag = "${TFS_Branch}-${Source_Version}".replaceAll(~/\s/, "").replaceAll(~/[()]/, ""); //remove spaces and parenthesis.
+
+                    docker.withRegistry("https://${AWS_Account}.dkr.ecr.${Region}.amazonaws.com", "ecr:${Region}:myUnityAutomation") {
+                        imgs.each { img ->
+                                docker.image("${img.value}:${tag}").pull()
+                        }
+                    }
+                }
+            }
+        }
+        stage('retag-images') {
+            agent {label 'Linux'}
+            steps {
+                //Retag them
+                script {
+                    String tag = "${TFS_Branch}-${Source_Version}".replaceAll(~/\s/, "").replaceAll(~/[()]/, ""); //remove spaces and parenthesis.
+                    imgs.each { img ->
+                        sh "docker tag ${AWS_Account}.dkr.ecr.${Region}.amazonaws.com/${img.value}:${tag} ntst.jfrog.io/myunity-backoffice-docker-local/${img.value}:${Target_Version}"
+                    }
+                }
+            }
+        }
+        stage ('Upload Artifacts to Artifactory'){
+            agent {label 'msbuild'}
+            environment {
+                targetVersion = "${Target_Version}"
+            }
+            steps {
+                script {
+                    if (UploadArtifactsToArtifactory.toBoolean()) {
+                        rtUpload (
+                        serverId: "artifactory-cloud",
+                        spec:
+                            """{
+                            "files": [
+                                {
+                                "pattern": "ntst-artifactory-promote-web\\${web_bootstrapper}",
+                                "target": "myunity-backoffice-local/web/myunity-backoffice/"
+                                },
+                                {
+                                "pattern": "ntst-artifactory-promote-web\\${web_app}",
+                                "target": "myunity-backoffice-local/web/myunity-backoffice/"
+                                },
+                                {
+                                "pattern": "ntst-artifactory-promote-web\\${db_upgrade}",
+                                "target": "myunity-backoffice-local/database/upgrade/"
+                                },
+                                {
+                                "pattern": "ntst-artifactory-promote-web\\${crm_filewatcher}",
+                                "target": "myunity-backoffice-local/web/myunity-backoffice/"
+                                }
+                            ]
+                            }"""
+                        )
+                    }
+                }
+            }
+        }
+        stage ('Push images to Artifactory') {
+            agent {label 'Linux'}
+            environment {
+                targetVersion = "${Target_Version}"
+            }
+            steps {
+                script {
+                    if (UploadArtifactsToArtifactory.toBoolean()) {
+                        withCredentials([usernamePassword(credentialsId: '1bdf09fd-d601-40f8-bdc8-f2ac0fa6f2d0', passwordVariable: 'JFROG_PWD', usernameVariable: 'JFROG_USER')]) {
+                            sh "docker login -u ${JFROG_USER} -p ${JFROG_PWD} ntst.jfrog.io"
+                            imgs.each { img ->
+                                echo "Pushing ${img.value} to Artifactory"
+                                sh "docker push ntst.jfrog.io/myunity-backoffice-docker-local/${img.value}:${targetVersion}"
+                            }
+                            sh "docker logout ntst.jfrog.io"
+                        }
+                    }
+                }
+            }
+        }
+        stage('cleanup-artifacts') {
+            agent {label 'msbuild'}
+            steps {
+                cleanUpArtifacts("${ENV:WORKSPACE}\\ntst-artifactory-promote-web", "cleanup-promoted-artifacts.ps1")
+            }
+        }
+        stage('cleanup-images') {
+            agent {label 'Linux'}
+            steps {
+                script {
+                    String tag = "${TFS_Branch}-${Source_Version}".replaceAll(~/\s/, "").replaceAll(~/[()]/, ""); //remove spaces and parenthesis.
+                    imgs.each { img ->
+                        sh "docker rmi ntst.jfrog.io/myunity-backoffice-docker-local/${img.value}:${Target_Version}"
+                        sh "docker rmi ${AWS_Account}.dkr.ecr.${Region}.amazonaws.com/${img.value}:${tag}"
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,145 @@
+import groovy.json.JsonSlurper
+
+awsRegion = "${AWSRegion}"
+artifactoryRepo = 'myunity-backoffice-local'
+artifactorysourcepathCRM = 'web\\crm'
+artifactorysourcepathHelp = 'web\\help'
+s3TargetpathCRM = 'CRM/'
+s3TargetpathHelp = 'BackofficeHelp/'
+
+def artifactorysourcepath
+def s3Targetpath
+
+if (env.JENKINS_URL.contains('myunity-bo-prod-jenkins')) {
+    s3Bucket = "988099092108-myunity-bo-released-packages"
+}
+else if (env.JENKINS_URL.contains('myunity-bo-test-jenkins')) {
+    s3Bucket = "434495414204-myunity-bo-released-packages"
+}
+else{
+    error("Unknown Jenkins instance... Exiting")
+}
+
+def checkoutService(gitRepo, gitBranch) {
+    //bitbucket account id from jenkins
+    echo "Pulling source repo: ${gitRepo}"
+    echo "Branch: ${gitBranch}"
+    def git_credentials_id = "bitbucket_bbcloudapi"
+    def gitBranchParameter = "${gitBranch}".toString()
+    checkout([$class: 'GitSCM',
+          branches: [[name: "${gitBranchParameter}"]],
+          doGenerateSubmoduleConfigurations: false,
+          submoduleCfg: [],
+          userRemoteConfigs: [[url: "https://bitbucket.org/ntsttech/${gitRepo}.git", credentialsId: "${git_credentials_id}"]],
+         ])
+}
+
+
+
+def cleanUpArtifacts(localFolder, scriptName) {
+    //This will go delete the files from the Jenkins Node
+    powershell(returnStdout: true, script: """
+        Using module \"${ENV:WORKSPACE}\\Powershell\\mubo_core.psm1\";
+        
+        function Invoke-CleanUpArtifacts {
+            & (Get-ScriptDirectory -PostPath \"${ENV:WORKSPACE}\\Powershell\\""" + scriptName + """\") `
+                -LocalFolder \"""" + localFolder + """\";
+        }
+        
+        function Main {
+            Invoke-CleanUpArtifacts;
+        }
+        
+        Main
+     """)
+}
+
+pipeline {
+    agent none
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '1'))
+    }
+    
+    stages {
+    
+        stage('clean-workspace') {
+            agent {label 'msbuild'}
+            steps {
+                cleanWs()
+            }
+        }
+        stage('checkout-source-code') {
+            agent {label 'msbuild'}
+            steps {
+                checkoutService("mubo-devops", scm.branches[0].name)
+            }
+        }
+        stage('SetParameters') {
+            agent {label 'msbuild'}
+            steps {     
+                script {
+                    switch("${ArtifactType}") {            
+                        case 'CRM': 
+                            artifactorysourcepath = "${artifactoryRepo}\\${artifactorysourcepathCRM}"
+                            stagedsourcepath = artifactorysourcepathCRM
+                            s3Targetpath = s3TargetpathCRM
+                        break; 
+                        case 'Help': 
+                            artifactorysourcepath = "${artifactoryRepo}\\${artifactorysourcepathHelp}"
+                            stagedsourcepath = artifactorysourcepathHelp
+                            s3Targetpath = s3TargetpathHelp
+                        break; 
+                        default: 
+                            error "The value '${ArtifactType}' is unknown"; 
+                        break; 
+                    }
+                }
+                echo "artifactorysourcepath: ${artifactorysourcepath}"
+                echo "s3Targetpath: ${s3Targetpath}"
+            }
+        }
+        stage('Get Artifacts From Artifactory') {
+            agent {label 'msbuild'}
+            steps {
+                echo "artifactory pattern: ${artifactorysourcepath}\\${ArtifactName}.zip"
+                rtDownload (
+                   serverId: "artifactory-cloud",
+                   failNoOp: true,
+                   spec:
+                       """{
+                       "files": [
+                           {
+                           "pattern": "${artifactorysourcepath}\\${ArtifactName}",
+                           "target": "ntst-artifactory-promoted-web\\"
+                           }
+                       ]
+                       }"""
+                )
+            }
+        }
+        stage ('Upload Artifacts to AWS'){
+            agent { label 'msbuild' }
+            steps {
+                withAWS(region: awsRegion) {
+                    echo "Uploading content ${s3Bucket}\\${s3Targetpath}\\${ArtifactName}";
+
+                    s3Upload(pathStyleAccessEnabled: true,
+                        payloadSigningEnabled: true,
+                        file: "${ArtifactName}", 
+                        workingDir: "ntst-artifactory-promoted-web\\${stagedsourcepath}",
+                        path: "${s3Targetpath}${ArtifactName}",
+                        bucket: "${s3Bucket}",
+                        verbose : true
+                    )
+                }
+            }
+        }        
+        stage('cleanup-artifacts') {
+            agent {label 'msbuild'}
+            steps {
+                cleanUpArtifacts("${ENV:WORKSPACE}\\ntst-artifactory-promoted-web\\", 
+                    "cleanup-promoted-artifacts.ps1")
+            }
+        }
+    }
+}

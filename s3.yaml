@@ -1,0 +1,118 @@
+Description: >
+  S3 Infrastructure for myUnity
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Application Configuration"
+        Parameters:
+          - ServiceName
+          - Application
+          - ResourceName
+      - Label:
+          default: "Finance Configuration"
+        Parameters:
+          - ProductFamily
+          - ProductSKU
+          - CostCenter
+          - PurchaseOrder
+          - Client
+          - ResourceType
+          - Environment
+
+Parameters:
+  ServiceName:
+    Description: Name of Service
+    Type: String
+  Application:
+    Type: String
+    Description: The Application tag is used to designate the application of the associated AWS resource. In this capacity application does not refer to an installed software component, but rather the overall business application that the resource supports.
+    Default: myunity
+  ResourceName:
+    Type: String
+  CostCenter:
+    Type: String
+  PurchaseOrder:
+    Type: String
+  Client:
+    Type: String
+  ResourceType:
+    Type: String
+    AllowedValues:
+      - Application
+      - "Shared Service"
+      - "Support System"
+    Default: Application
+  Environment:
+    Type: String
+    Description: The environment tag (e.g. dev, qa, prod, etc.) is used to designate the Environment Stage of the associated AWS resource.
+  ProductFamily:
+    Type: String
+    Description: Product family code provided by Finance Team
+  ProductSKU:
+    Type: String
+    Description: Code provided by Finance team to map account spending to NTST billable applications
+
+Mappings:
+  CloudFormation:
+    Architecture:
+      Version: 1.0
+    MigrationAssistanceProgram:
+      ServerId: d-server-02bezuej0o1ftf
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join ["-", [!Ref "AWS::AccountId", !Ref ServiceName]]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: !Join ["-", [!Ref Application, !Ref Environment, !Ref ResourceName]]
+        - Key: Application
+          Value: !Ref Application
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Type
+          Value: !Ref ResourceType
+        - Key: ArchitectureVersion
+          Value: !FindInMap [CloudFormation, Architecture, Version]
+        - Key: map-migrated
+          Value: !FindInMap [CloudFormation, MigrationAssistanceProgram, ServerId]
+        - Key: ProductFamily
+          Value: !Ref ProductFamily
+        - Key: ProductSKU
+          Value: !Ref ProductSKU
+        - Key: Client
+          Value: !Ref Client
+        - Key: PurchaseOrder
+          Value: !Ref PurchaseOrder
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Statement:
+          - Action:
+              - s3:*
+            Effect: Deny
+            Resource: !Sub "arn:aws:s3:::${S3Bucket}/*"
+            Principal: '*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+Outputs:
+  S3Bucket:
+    Value: !Ref S3Bucket
+    Export:
+      Name: !Join ["-", [!Ref "AWS::AccountId", !Ref ServiceName, bucket]]

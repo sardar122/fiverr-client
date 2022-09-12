@@ -1,0 +1,123 @@
+Description: >
+    Amazon ECR Repository
+    Last Update:
+      20201112 | devops-3997 | Add RepositoryPolicyText
+
+Parameters:
+  Application:
+      Description: Name of Application
+      Type: String
+      Default: "myunity-bo-svc"
+  ResourceName:
+      Type: String
+  ServiceName:
+      Description: Name of Service
+      Type: String
+  Environment:
+    Description: The type of the environment (e.g. dev, qa, prod, etc.). This value will be appended as a suffix to the stack resources.
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - qa
+      - uat
+      - demo
+      - prod
+  CostCenter:
+    Type: String
+    Default: "myunity" # TODO: Remove
+  PurchaseOrder:
+    Type: String
+    Default: "myunity" # TODO: Remove
+  Client:
+    Type: String
+    Default: "myunity" # TODO: Remove
+  ResourceType:
+    Type: String
+    AllowedValues:
+      - Application
+      - "Shared Service"
+      - "Support System"
+    Default: Application
+  ProductFamily:
+    Type: String
+    Description: Product family code provided by Finance Team
+    Default: "myunity" # TODO: Remove
+  ProductSKU:
+    Type: String
+    Description: Code provided by Finance team to map account spending to NTST billable applications
+    Default: "myunity" # TODO: Remove
+  NonProdAccountId:
+    Type: String
+    AllowedPattern: ^[0-9]*
+    Default: "434495414204"
+  ProdAccountId:
+    Type: String
+    AllowedPattern: ^[0-9]*
+    Default: "988099092108"
+
+Mappings:
+  CloudFormation:
+    Architecture:
+      Version: 1.0
+    MigrationAssistanceProgram:
+      ServerId: d-server-02bezuej0o1ftf
+
+Conditions:
+  Prod: !Equals [!Ref Environment, "prod"]
+
+Resources:
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName:
+        !If [Prod, !Join ['-', [!Ref Application, !Ref ServiceName, 'prod']], !Join ['-', [!Ref Application, !Ref ServiceName, 'non-prod']]]
+      ImageScanningConfiguration:
+        scanOnPush: "true"
+      RepositoryPolicyText:
+        Version: '2008-10-17'
+        Statement:
+        - Effect: Allow
+          Sid: AllowAccess
+          Principal:
+            AWS:
+            - !Join ['', ['arn:aws:iam::', !Ref NonProdAccountId, ':root']]
+            - !Join ['', ['arn:aws:iam::', !Ref ProdAccountId, ':root']]
+          Action:
+          - ecr:BatchCheckLayerAvailability
+          - ecr:BatchGetImage
+          - ecr:CompleteLayerUpload
+          - ecr:GetAuthorizationToken
+          - ecr:GetDownloadUrlForLayer
+          - ecr:InitiateLayerUpload
+          - ecr:PutImage
+          - ecr:UploadLayerPart
+
+      Tags:
+        - Key: Name
+          Value: !Join ["-", [!Ref Application, !Ref Environment, !Ref ResourceName]]
+        - Key: Application
+          Value: !Ref Application
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ProductFamily
+          Value: !Ref ProductFamily
+        - Key: ProductSKU
+          Value: !Ref ProductSKU
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Type
+          Value: !Ref ResourceType
+        - Key: Client
+          Value: !Ref Client
+        - Key: PurchaseOrder
+          Value: !Ref PurchaseOrder
+        - Key: ArchitectureVersion
+          Value: !FindInMap [CloudFormation, Architecture, Version]
+        - Key: map-migrated
+          Value: !FindInMap [CloudFormation, MigrationAssistanceProgram, ServerId]
+
+Outputs:
+  Repository:
+    Description: Amazon ECR Repository
+    Value: !Ref Repository

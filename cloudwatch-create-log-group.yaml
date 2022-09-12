@@ -1,0 +1,79 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+    This template deploys the log group.
+    Last Update:
+      2022.02.15
+
+Parameters:
+  Application:
+    Type: String
+    Description: The Application tag is used to designate the application of the associated AWS resource. In this capacity application does not refer to an installed software component, but rather the overall business application that the resource supports.
+    Default: myunity
+  ResourceName:
+    Type: String
+  CostCenter:
+    Type: String
+  Environment:
+    Type: String
+    Description: The environment tag (e.g. dev, qa, prod, etc.) is used to designate the Environment Stage of the associated AWS resource.
+  ResourceType:
+    Type: String
+    AllowedValues:
+      - Application
+      - "Shared Service"
+      - "Support System"
+    Default: Application
+  StackIDParameter: 
+    Description: "Environment stack. i.e. t1, t2, s1, s2, p1, p2, ..."
+    Type: String
+  RetentionDaysParameter:
+    Description: "Days to retain logs."
+    Type: Number
+    Default: 7
+  AwsServiceParameter:
+    Description: "aws service"
+    Type: String
+    AllowedValues:
+      - ecs
+  ProductServiceParameter:
+    Description: "aws service"
+    Type: String
+    AllowedValues:
+      - 'myunity-services-linux'
+
+Mappings:
+  CloudFormation:
+    Architecture:
+      Version: 1.0
+    MigrationAssistanceProgram:
+      ServerId: d-server-02bezuej0o1ftf
+
+Resources:
+  CreateLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Join ['/', ['', !Ref AwsServiceParameter, !Ref StackIDParameter, !Ref ProductServiceParameter]]
+      RetentionInDays: !Ref RetentionDaysParameter
+      Tags:
+        - Key: Name
+          Value: !Join ["-", [!Ref Application, !Ref Environment, !Ref ResourceName]]
+        - Key: Application
+          Value: !Ref Application
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Type
+          Value: !Ref ResourceType
+        - Key: ArchitectureVersion
+          Value: !FindInMap [CloudFormation, Architecture, Version]
+        - Key: map-migrated
+          Value: !FindInMap [CloudFormation, MigrationAssistanceProgram, ServerId]
+
+Outputs:  
+  LogGroupName:
+    Description: Log group name
+    Value: !Ref CreateLogGroup
+  LogGroupRetention:
+    Description: Log group retention days
+    Value: !Ref RetentionDaysParameter

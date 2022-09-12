@@ -1,0 +1,54 @@
+#!/usr/bin/env groovy
+def checkoutService(gitRepo, gitBranch) {
+    //bitbucket account id from jenkins
+    echo "Pulling source repo: ${gitRepo}"
+    echo "Branch: ${gitBranch}"
+    def git_credentials_id = "bitbucket_bbcloudapi"
+    def gitBranchParameter = "${gitBranch}".toString()
+    checkout([$class: 'GitSCM',
+          branches: [[name: "${gitBranchParameter}"]],
+          doGenerateSubmoduleConfigurations: false,
+          submoduleCfg: [],
+          userRemoteConfigs: [[url: "https://bitbucket.org/ntsttech/${gitRepo}.git", credentialsId: "${git_credentials_id}"]],
+    ])
+}
+
+node(label: 'msbuild'){
+    def workspace = "${env.WORKSPACE}"
+    def tools_code = "${workspace}\\ecs"
+
+    // checkout from git
+    stage("checkout-tools"){
+        dir("${tools_code}"){
+            checkoutService("mubo-devops", scm.branches[0].name)
+        }
+    }
+
+    stage("gather-info"){
+        dir("${tools_code}"){
+			secret              = "AD_Service_Account"
+            domain              = bat (script: "@python Python\\get_secretsmanager.py ${secret} domain ${region}",returnStdout: true).trim()
+            fqdn                = bat (script: "@python Python\\get_secretsmanager.py ${secret} fqdn ${region}",returnStdout: true).trim()
+            username            = bat (script: "@python Python\\get_secretsmanager.py ${secret} username ${region}",returnStdout: true).trim()
+            password            = bat (script: "@python Python\\get_secretsmanager.py ${secret} password ${region}",returnStdout: true).trim();
+            domain_username     = "${domain}\\${username}"
+            username_fqdn       = "${username}@${fqdn}"
+            computerName        = "${computernamesource}"
+        }
+    }
+
+    stage("join-domain"){
+        dir("${tools_code}"){
+            if("${domain_join}" == "true"){
+                powershell "Send-SSMCommand -InstanceId '${ec2_instance_id}' -DocumentName 'mue-domainJoin' -Parameter @{username = '${domain_username}'; password = '${password}'; fqdn = '${fqdn}'; computerName = '${computerName}'} -Region ${region}"
+            }
+            else if("${domain_join}" == "false"){
+                powershell "Send-SSMCommand -InstanceId '${ec2_instance_id}' -DocumentName 'mue-domainUnjoin' -Parameter @{username = '${username_fqdn}'; password = '${password}'} -Region ${region}"
+            }
+            else{
+                echo "${domain_join}"
+                echo "Unknown parameter provided please check build parameter 'domain_join' and try again."
+            }
+        }
+    }
+}

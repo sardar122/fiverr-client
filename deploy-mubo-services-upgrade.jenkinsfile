@@ -1,0 +1,101 @@
+if (env.JENKINS_URL.contains('myunity-bo-prod-jenkins')) {
+    cost_center = "2016 Hosting - Post Acute"
+} else if (env.JENKINS_URL.contains('myunity-bo-test-jenkins')) {
+    cost_center = "5027 RD - myUnity Homecare and Hospice"
+} else {
+    error("Unknown Jenkins instance... Exiting")
+}
+
+def checkoutService(gitRepo, gitBranch) {
+    //bitbucket account id from jenkins
+    def git_credentials_id = "bitbucket_bbcloudapi"
+    def gitBranchParameter = "${gitBranch}".toString()
+    checkout([$class: 'GitSCM',
+        branches: [[name: "${gitBranchParameter}"]],
+        doGenerateSubmoduleConfigurations: false,
+        submoduleCfg: [],
+        userRemoteConfigs: [[url: "https://bitbucket.org/ntsttech/${gitRepo}.git", credentialsId: "${git_credentials_id}"]],
+    ])
+}
+
+def parameters
+
+def getParameters() {
+    def result = powershell(returnStdout: true, script: "aws ssm get-parameter --name \"/myUnity/Config/Stack_${StackId}/1.0/json\" --with-decryption --query \"Parameter.Value\" --output text")    
+    parameters = readJSON text: result
+    println result
+}
+
+def peformUpdate(scriptName) {
+    def output = powershell(returnStdout: true, script: """
+        Using module \"${ENV:WORKSPACE}\\Powershell\\mubo_core.psm1\";
+     
+        \$sp = [StackProperties]::new(
+            <# [String]\$stackID #>'${parameters.stack_id}',
+            <# [String]\$region #>'${parameters.aws_region}',
+            <# [String[]]\$clusterSecurityGroup #>@('${parameters.aws_security_group_fargate}'),
+            <# [String]\$taskRoleNameParameter #>'${parameters.aws_role_ECS_Execution}',
+            <# [String]\$targetVersion #>'${TargetVersion}',
+            <# [String]\$description #>'test', <#This value does not appear to get used by cloud formation when creating the app stack#>
+            <# [String]\$environmentType #>'${parameters.environment_type}',
+            <# [String]\$VpcIdParameter #>'${parameters.aws_vpc}',
+            <# [String[]]\$PublicSubnetsParameter #>@(${parameters.aws_public_subnets}),
+            <# [String[]]\$PrivateSubnetsParameter #>@(${parameters.aws_private_subnets}),
+            <# [String]\$LbCertArnParameter #>'${parameters.aws_load_balancer_cert_arn}',
+            <# [String[\$DisableRollback #>\$True,
+            <# [String[\$AppELBSecurityGroupParameter #>@('${parameters.aws_elastic_load_balanced_security_group}'),
+            <# [String[\$AppSecurityGroupParameter #>@('${parameters.aws_app_security_group}'),
+            <# [String[\$BastionHostSecurityGroupParameter #>@('${parameters.aws_bastion_host_security_group}'),
+            <# [String]\$DB_Name #>'${parameters.DB_Name}',
+            <# [String]\$Application #>'myUnity',
+            <# [String]\$ResourceType #>'Application',
+            <# [String]\$CostCenter #>'${cost_center}'
+        );
+
+        function Invoke-ServicesDeploy {            
+            param ([Parameter(Mandatory=\$true)][StackProperties]\$StackProperties)
+            & (Get-ScriptDirectory -PostPath \"${ENV:WORKSPACE}\\Powershell\\""" + scriptName + """\") `
+                -StackProperties \$StackProperties `
+        }
+
+        function Main {
+            \$sp;
+            Invoke-ServicesDeploy -StackProperties \$sp;
+        }
+
+        Main
+    """)
+    println output
+}
+
+pipeline {
+    agent { label 'msbuild' }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '1'))
+    }
+    stages {
+        stage('clean-workspace') {
+            steps {
+                // Clean before build
+                cleanWs()
+            }
+        }
+        stage('checkout-source-code') {
+            // checkout from git
+            steps {
+                checkoutService("${git_repo}", "${git_branch}")
+            }
+        }
+        stage('get-paramstore-parameters') {
+            steps {
+                getParameters()
+            }
+        }
+        stage('deploy-mubo-services')
+        {
+            steps {
+               peformUpdate('deploy-services-update.ps1')
+            }
+        }                
+    }
+}

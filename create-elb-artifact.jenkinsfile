@@ -1,0 +1,178 @@
+import org.apache.commons.io.FileUtils;
+def pathInS3 = "BuildOutputs/${ParentBuildName}/${ParentBuildNumber}"
+def artifactTag = "${ParentBuildNumber}";
+def awsRegion = "${AWSRegion}"
+def awsProfile = "${AWSProfile}"
+def sourceFileName = "output.zip"
+versionParamName = "myunity-package-versions"
+def versionJsonFileName = "version_info.json"
+def verParamsForParentBuildName
+
+def getVersionParamsForBuild() {
+    def retVal
+    def entVar
+    def result = powershell(returnStdout: true, script: """
+        aws ssm get-parameter --name \"${versionParamName}\" --with-decryption --query \"Parameter.Value\" --output text
+    """)    
+    entVar = readJSON text: result
+    retVal = entVar."${ParentBuildName}"
+    println retVal
+    return retVal;
+}
+
+pipeline {
+    agent { label 'msbuild' }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '5'))
+    }
+    stages {
+        stage('clean-destination-folder') {
+            steps {
+                dir('a') {
+                    deleteDir()
+                }
+            }
+        }
+        stage("get-paramstore-variables") {
+            steps {
+                script {
+                  verParamsForParentBuildName = getVersionParamsForBuild();
+                }
+            }
+        }
+        stage("download-and-unzip-build-files") {
+            steps {
+                withAWS(region: awsRegion, credentials: awsProfile) {
+                    echo "Getting content from S3 with AWS creds";
+                    s3Download(file: sourceFileName, bucket: "${AWSS3Bucket}", path: "${pathInS3}/${sourceFileName}", force: true)
+                    unzip dir: 'a', glob: '', zipFile: sourceFileName
+                }
+            }
+        }
+        stage('build-ebs-app-artifact') {
+            steps {
+                script {
+                    powershell(returnStdout: true, script: """
+
+                        \$workspacePath = "${env.WORKSPACE}\\a"
+                        \$destinationPath = "${env.WORKSPACE}\\a\\Results"
+
+                        \$webApps = @{}
+                        \$webApps.Add('HMXWeb', '')
+                        \$webApps.Add('HMXWebAPI', 'VisionAPI')
+                        \$webApps.Add('HMXWebReports', 'HMXWebReports')
+                        \$webApps.Add('iCare', 'iCare')
+                        \$webApps.Add('Touchscreen', 'Touchscreen')
+                        \$webApps.Add('VisionMobile', 'VisionMobile')
+
+                        \$sourcePathRoot = "\$workspacePath\\_PublishedWebsites";
+                        \$destinationRoot = "\$workspacePath\\ElasticBeanstalk";
+                        \$zipName = 'ebs-web-app_${artifactTag}.zip';
+                        \$zipTempPath = "\$workspacePath\\\$zipName";
+                        \$zipPath = "\$destinationPath\\\$zipName";
+
+                        if (Test-Path \$destinationRoot) {
+                            Write-Host "Cleaning \$destinationRoot"
+                            Remove-Item \$destinationRoot -Force -Recurse
+                        }
+
+                        if (Test-Path \$zipTempPath) {
+                            Write-Host "Cleaning \$zipTempPath"
+                            Remove-Item \$zipTempPath -Force
+                        }
+
+
+                        if (Test-Path \$zipPath) {
+                            Write-Host "Cleaning \$zipPath"
+                            Remove-Item \$zipPath -Force
+                        }
+                                
+                        #copy the apps in the structure required for beanstalk
+                        foreach(\$app in \$webApps.GetEnumerator()) {
+
+                        if(\$app.Value) {
+                            \$sourcePath = "\$sourcePathRoot\\\$(\$app.Name)";
+                            \$appDestinationPath = "\$destinationRoot\\\$(\$app.Value)";
+                        } else {
+                            \$sourcePath = "\$sourcePathRoot\\\$(\$app.Name)\\*";
+                            \$appDestinationPath = \$destinationRoot;
+                        }
+
+                        Write-Host "Copy \$sourcePath to \$appDestinationPath";
+                        Copy-Item -Path \$sourcePath -Destination \$appDestinationPath -Recurse -Force
+                    }
+                                
+                    #remove @@lines from config files.This will cause the app to look for values from environmentVariables and AWS ParamStore.
+                    \$configFiles = "\$destinationRoot\\iCare\\Config\\iCare.config", "\$destinationRoot\\Touchscreen\\Config\\TS.config", "\$destinationRoot\\Config\\Vision.config"
+                    foreach(\$item in \$configFiles) {
+                        Write-Host "Cleaning config file: \$item for ELB deployment"
+                        if (Test-Path \$item) {
+                            Set-ItemProperty \$item -name IsReadOnly -value \$false
+                                
+                            #get all lines except the ones that contain @@    
+                            \$cleanedLines = Get-Content \$item | Where-Object {\$_ -match '^((?!@@).)*\$' } 
+                                        
+                            #write the file back
+                            if (\$cleanedLines) {
+                                Set-Content -Path \$item -Value \$cleanedLines -Force -Encoding UTF8
+                            }
+                        } else {
+                            Write-Host "File not found! \$item"
+                        }
+                    }
+                            
+                    #compress the folder
+                    Write-Host "Creating \$zipTempPath";
+                    Compress-Archive -Path "\$destinationRoot\\*" -DestinationPath \$zipTempPath
+                                
+                    #copy to the artifacts folder
+                    Write-Host 'Copy zip to artifact path';
+                    If(!(test-path \$destinationPath)) { New-Item -ItemType Directory -Force -Path \$destinationPath }
+
+                    Copy-Item -Path \$zipTempPath -Destination \$zipPath -Recurse
+                """);
+            }
+        }
+    }
+    stage('build-ebs-bootstrapper-artifact') {
+        steps {
+            powershell("""
+                \$deploySourceDir = "${env.WORKSPACE}\\a\\Source\\Deploy\\ElasticBeanstalk\\HMXWeb"
+
+                Powershell\\create-version-info-file.ps1 -build_name "${ParentBuildName}" -build_number "${ParentBuildNumber}" -crm "${verParamsForParentBuildName.crm}" -myUnity_bo_help "${verParamsForParentBuildName.myUnity_bo_help}" -version_file_destination "\$deploySourceDir"
+
+                \$ebsConfigPath = "\${deploySourceDir}\\*"
+                \$zipPath = '${env.WORKSPACE}\\a\\Results\\ebs-web-bootstrapper_${artifactTag}.zip'
+                        
+                if (Test-Path \$zipPath) {
+                    Write-Host "Cleaning \$zipPath"
+                    Remove-Item \$zipPath -Force
+                }
+
+                Compress-Archive -Path \$ebsConfigPath -DestinationPath \$zipPath
+            """)
+        }
+    }
+    stage('archive-build-artifacts') {
+        steps {
+            archiveArtifacts artifacts: 'a/Results/*.zip',
+                onlyIfSuccessful: true;
+        }
+    }
+    stage('upload-to-aws-s3') {
+        steps {
+            script {
+                if (AWSUploadToS3.toBoolean()) {
+                    build job: 'mubo-build-artifact-upload-aws-s3', parameters: [
+                        string(name: 'ParentBuildName', value: "${JOB_NAME}"),
+                        string(name: 'ParentBuildNumber', value: "${BUILD_NUMBER}"),
+                        string(name: 'OriginalCallingJobName', value: "${ParentBuildName}"),
+                        booleanParam(name: 'Flatten', value: true),
+                        string(name: 'S3includePathPattern', value: "**/*.zip")
+                    ]
+                }
+            }
+        }
+    }
+}
+    }

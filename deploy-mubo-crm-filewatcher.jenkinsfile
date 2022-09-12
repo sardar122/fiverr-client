@@ -1,0 +1,159 @@
+#!/usr/bin/env groovy
+
+import groovy.json.JsonSlurper
+
+if (env.JENKINS_URL.contains('myunity-bo-prod-jenkins')) {
+    environmentA = "prod"
+    environmentB = "uat"
+}
+else if (env.JENKINS_URL.contains('myunity-bo-test-jenkins')){
+    environmentA = "qa"
+    environmentB = "dev"
+}
+else{
+    error("Unknown Jenkins instance... Exiting")
+}
+
+def checkoutService(gitRepo, gitBranch) {
+    //bitbucket account id from jenkins
+    def git_credentials_id = "bitbucket_bbcloudapi"
+    def gitBranchParameter = "${gitBranch}".toString()
+    checkout([$class: 'GitSCM',
+          branches: [[name: "${gitBranchParameter}"]],
+          doGenerateSubmoduleConfigurations: false,
+          submoduleCfg: [],
+          userRemoteConfigs: [[url: "https://bitbucket.org/ntsttech/${gitRepo}.git", credentialsId: "${git_credentials_id}"]],
+    ])
+}
+
+node(label: 'msbuild'){
+    def workspace = "${env.WORKSPACE}"
+    def cfn_repo = "${workspace}\\cfn"
+    def parameters
+
+    // checkout from git
+    stage("checkout-tools"){
+        dir("${cfn_repo}"){
+            checkoutService("mubo-devops","master")
+        }
+    }
+
+    stage("get-parameter") {
+        def result = powershell(returnStdout: true, script: "aws ssm get-parameter --name \"/myUnity/Config/Stack_${StackId}/1.0/json\" --with-decryption --query \"Parameter.Value\" --output text")    
+        parameters = readJSON text: result
+        println result
+    }
+
+    stage("gather-info"){
+        dir("${cfn_repo}"){
+            if (target_environments == "live"){
+                prefix = "${environmentA}"
+            }
+            else{
+                prefix = "${environmentB}"
+            }
+
+            service = "myunity"
+            ec2_cfn_stack_name   = "${prefix}-ec2-crm"
+            ec2_instance_id = bat (script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${parameters.aws_region} ${ec2_cfn_stack_name} Ec2Instance",returnStdout: true).trim()
+        }
+    }
+    
+    servicedeploy:{
+        stage("deploy-service"){
+            def bv = parameters.aws_web_app_bucket
+            def bucketName = bv.substring(0,bv.indexOf('/'))
+            def buildName = bv.substring(bv.indexOf('/')+1)
+            def fileName = "crm-filewatcher_${TargetVersion}.zip"
+            def bucketPath = "${buildName}/${fileName}"
+
+            echo "Deploying CRM File Watcher Update"
+            dir("${cfn_repo}"){
+                psCommands = '''
+                    $ErrorActionPreference = "Stop"
+
+                    #Get a stack config. Any stack using the correct WCSecure is fine
+                    $param = Get-SSMParameter -Name "/myUnity/Config/Stack_''' + StackId + '''/Web/1.0/json" -WithDecryption $true
+                    $paramVal = $param.Value | ConvertFrom-Json
+
+                    $serviceName = "CRMFileWatcher"
+
+                    #Register global env variables for the CRM File Watcher
+                    setx /m "MUE_DB_Name" $paramVal.DB_Name
+                    setx /m "MUE_DB_UserID" $paramVal.DB_UserID
+                    setx /m "MUE_DB_Password" $paramVal.DB_Password
+                    setx /m "MUE_DB_WCSecureName" $paramVal.DB_WCSecureName
+                    setx /m "MUE_Logging_Directory" "C:\\\\ProgramData\\\\Netsmart\\\\Logs\\\\$serviceName"
+                    setx /m "MUE_Logging_MinimumSeverityLevel" "Information"
+                    setx /m "MUE_Logging_AppName" $serviceName
+                    setx /m "MUE_DB_ApplicationName" $serviceName
+                    setx /m "MUE_UseAWS" "true"
+
+                    try {
+                        $service = Get-Service -Name $serviceName
+                    } catch {
+                        $service = ""
+                        Write-Output "No service named ${serviceName} exists. This service will be created."
+                    }
+
+                    if ($service.Length -ne 0) {
+                        Write-Output "Stopping service: ${serviceName}"
+                        Stop-Service -Name $serviceName
+                    }
+
+                    $tempFolder = "C:\\\\CRMTemp"
+                    $tempFilePath = "$tempFolder\\\\''' + fileName + '''"
+
+                    #clean existing files or create if directory is not there
+                    if (Test-Path -Path $tempFolder) {
+                        Remove-Item "$tempFolder/*" -Recurse -Force
+                    } else {
+                        New-Item -Path $tempFolder -ItemType Directory
+                    } 
+
+                    Read-S3Object -BucketName "''' + bucketName + '''" -Key "''' + bucketPath + '''" -File $tempFilePath
+
+                    $installLocation = "C:\\\\Program Files (x86)\\\\CRMFileWatcher"
+
+                    Expand-Archive -LiteralPath $tempFilePath -DestinationPath $installLocation -Force
+
+                    try {
+                        $service = Get-Service -Name $serviceName
+                    } catch {
+                        Write-Output "Creating service: ${serviceName}"
+                        New-Service -Name $serviceName `
+                            -BinaryPathName "$installLocation\\\\CRMFileWatcher.exe" `
+                            -DisplayName "CRM File Watcher" `
+                            -Description "File Watcher to move files to the local file system from S3 for the CRM HL7 Service to consume" 
+
+                        $service = Get-Service -Name $serviceName
+                    }
+
+                    Write-Output "Starting service: ${serviceName}"
+                    Start-Service -Name $serviceName 
+                '''
+
+                powershell '''\
+                    $runPSCommand = Send-SSMCommand `
+                        -InstanceId "''' + ec2_instance_id + '''" `
+                        -DocumentName "AWS-RunPowerShellScript" `
+                        -Parameter @{'commands' = ' ''' + psCommands + ''' '}
+
+                    do {  
+                            Start-Sleep -Seconds 5;      
+                            $return = Get-SSMCommandInvocation `
+                                -CommandId $runPSCommand.CommandId `
+                                -Details $true `
+                                -InstanceId ''' + ec2_instance_id + ''' | Select-Object -ExpandProperty CommandPlugins
+                        } while ($return.ResponseCode -eq -1)                    
+
+                    Write-Output "Command Status: $($return.Status)"
+                    Write-Output "Command Output: $($return.Output)"
+                    if ($return.ResponseCode -ne 0) {
+                        Write-Error "An error occurred while deploying CRM File Watcher service."
+                    }        
+                '''.stripIndent() 
+            }
+        }
+    }
+}

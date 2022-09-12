@@ -1,0 +1,245 @@
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import org.apache.commons.io.FileUtils;
+String computerName = InetAddress.getLocalHost().getHostName();
+println "ComputerName: ${computerName}"
+String buildNumber = "${JOB_BASE_NAME}.${BUILD_NUMBER}"
+String buildNumberStripped = "${JOB_BASE_NAME}-${BUILD_NUMBER}".replaceAll(~/\s/, "").replaceAll(~/[()]/, "");//remove spaces and parenthesis.
+String jobNameStripped = "${JOB_BASE_NAME}".replaceAll(~/\s/, "").replaceAll(~/[()]/, "");//remove spaces and parenthesis.
+String tfsServerURL = "https://dev-ltctfs.ntst.com/myUnityCollection/";
+def dbArtifactName = "dbupgrade_${BUILD_NUMBER}.zip"
+outputZipName = "output.zip"
+testFilesZipName = "testdependencies.zip"
+testFilesDirName = "testdependencies"
+
+pipeline {
+    agent { label 'msbuild' }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '1'))
+    }
+    environment {
+        SOURCES_DIRECTORY = "${env.WORKSPACE}\\s";
+        BINARIES_DIRECTORY = "${env.WORKSPACE}\\b";
+        WORKSPACE_NAME = "Jenkins-${JOB_BASE_NAME}-${env.NODE_NAME}".replaceAll(~/\s/, "");
+        VBC_TOOL_PATH = 'C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools\\MSBuild\\Current\\Bin\\Roslyn';
+        CSC_TOOL_PATH = 'C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools\\MSBuild\\Current\\Bin\\Roslyn';
+        //TF = "\"${tool(type: 'com.cloudbees.jenkins.plugins.customtools.CustomTool', name: 'TF')}\\tf.exe\"";
+        TF = '"C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools\\Common7\\IDE\\CommonExtensions\\Microsoft\\TeamFoundation\\Team Explorer\\TF.exe"';
+        Bootstrapper_Path = "\\\\LTCFSTFSDROP04.eng.ntst.com\\TFSDrop\\Bootstrappers\\v1.7DEV";
+        VSTEST_PATH = 'C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools\\Common7\\IDE\\Extensions\\TestPlatform\\vstest.console.exe';
+        //NUGET = "${tool(type: 'com.cloudbees.jenkins.plugins.customtools.CustomTool', name: 'nuget591')}\\nuget.exe";
+        NUGET = "C:\\Nuget\\nuget.exe";
+        //NET35 = "${tool(type: 'com.cloudbees.jenkins.plugins.customtools.CustomTool', name: 'net35')}\\dotnetfx35setup.exe";
+        //WIX = "${tool(type: 'com.cloudbees.jenkins.plugins.customtools.CustomTool', name: 'wix311')}\\wix311.exe";
+        WIX = "C:\\wix3\\wix311.exe";
+        NUGETCONFIG = "${env.WORKSPACE}\\s\\Source\\NuGet.config";
+        ////DOCKER = "${tool(type: 'com.cloudbees.jenkins.plugins.customtools.CustomTool', name: 'Docker')}";
+        HMX_TFSBuild = credentials('HMX_TFSBuild');
+        HMX_TFSBuild_NoDomain = credentials('HMX_TFSBuild_NoDomain'); //no domain in the user name
+    }
+    stages {
+        stage('checkout-source-code') {
+            steps {
+                dir('a') {
+                    deleteDir()
+                }
+                dir('b') {
+                    deleteDir()
+                }
+                script {
+                    Boolean cleaned = false;
+                    String wsName = "%WORKSPACE_NAME%"
+                    Boolean wsExists;
+                    //set the mappings
+                    def mappings = ["${TFSBranchPath}": "%SOURCES_DIRECTORY%", "${TFSArchivePath}": "%SOURCES_DIRECTORY%\\Archive", "\$/HMX/Ensemble/DEV": "%SOURCES_DIRECTORY%\\Ensemble"]
+                    def cloakings = ["${TFSBranchPath}/Source/Training Videos"];
+                    def wsExistsOut;
+                    try {
+                        println "Checking if workspace exists...";
+                        def cmdExitCode;
+                        cmdExitCode = bat(returnStdout: true, returnStatus: true, script: "%TF% workfold /collection:${tfsServerURL} /workspace:${wsName} /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW%")
+                        if (cmdExitCode == 100) {
+                            println "Workspace did not exist."
+                            wsExists = false;
+                            cleanWS = false;
+                        } else {
+                            wsName = "${WORKSPACE_NAME}"
+                            println "Workspace exists: ${wsName}"
+                            wsExists = true;
+                            cleanWS = true;
+                        }
+                    } catch (Exception e) {
+                        def msg = e.getMessage();
+                        println "msg: ${msg}";
+                        error("msg: ${msg}");
+                    }
+                    Boolean cleanWS = Clean_Workspace.toBoolean();
+                    println "Clean_Workspace: ${cleanWS}"
+
+                    //if it doesn't exist or delete it if we want to clean
+                    if (wsExists && cleanWS) {
+                        println "Attempting to clean ${env.WORKSPACE}"
+                        cleanWs(); //clean the workspace folder                        
+                        bat "%TF% vc workspace /delete ${wsName};${HMX_TFSBuild_USR} /collection:${tfsServerURL} /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW% /noprompt"
+                        cleaned = true;
+                    }
+
+                    //if the workspace doesn't exist or it was cleaned create it.
+                    if (!wsExists || cleaned) {
+                        println "Creating new workspace..."
+                        //bat "%TF% workspace /new ${wsName};${HMX_TFSBuild_USR} /collection:${tfsServerURL} /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW% /noprompt"
+                        bat(returnStdout: true, script: "%TF% workspace /new ${wsName};${HMX_TFSBuild_USR} /collection:${tfsServerURL} /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW% /noprompt").readLines().drop(1).join(" ")
+                        bat "%TF% vc workfold /unmap /workspace:${wsName} \$/ /collection:${tfsServerURL} /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW% /noprompt"
+                        println "Creating new workspace mappings..."
+                        mappings.each{ server, local -> bat "%TF% vc workfold /map /workspace:\"${wsName}\" \"${server}\" \"${local}\" /collection:${tfsServerURL} /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW% /noprompt" };
+                        cloakings.each { bat "%TF% vc workfold /cloak /workspace:${wsName} \"${it}\" /collection:${tfsServerURL} /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW% /noprompt" };
+                    }
+
+                    //if we didnt change the workspace check for pending changes and undo if any.
+                    if (wsExists && !cleaned) {
+                        //def pendingchanges = bat (returnStdout: true, script: "@echo off && %TF% stat /workspace:\"${wsName};${HMX_TFSBuild_USR}\" /collection:${tfsServerURL} /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW% && echo %ERRORLEVEL%").readLines().join(" ")
+                        def pendingchanges = bat(returnStdout: true, script: "@echo off && %TF% stat /workspace:\"${wsName};${HMX_TFSBuild_USR}\" /collection:${tfsServerURL} /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW%").readLines().join(" ")
+                        if ('There are no pending changes'.equalsIgnoreCase(pendingchanges)) {
+                            println "undo any pending changes..."
+                            bat "%TF% vc undo /recursive \"%SOURCES_DIRECTORY%\" /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW% /noprompt"
+                        }
+                    }
+
+                    //get from source
+                    bat "%TF% get \"%SOURCES_DIRECTORY%\" /recursive /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW% /version:${Source_Version} /force /noprompt"
+
+                    if (ShelveSet?.trim()) { //get shelveset if specified
+                        bat "%TF% vc unshelve ${ShelveSet.trim()} /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW% /noprompt"
+                    }
+                }
+            }
+        }
+        stage('build-tfsbuildtool') {
+            steps {
+                bat "\"${tool 'msBuild2019'}\\msbuild\" \"%SOURCES_DIRECTORY%\\Source\\DLLs\\.NET\\Utilities\\TFSBuildTool\\TFSBuildTool.sln\" /nologo /nr:false /tv:Current /p:VbcToolPath=\"%VBC_TOOL_PATH%\" /p:CscToolPath=\"%CSC_TOOL_PATH%\" /maxcpucount:8 /p:nowarn=\"40000;42016;41999;42017;42018;42019;42032;42036;42020;42021;42022;42353;42354;42355\" /p:RunCodeAnalysis=\"false\" /verbosity:\"Minimal\" /p:platform=\"Any CPU\" /p:configuration=\"Release\" /p:VisualStudioVersion=\"16.0\" -t:build /restore /p:RestoreConfigFile=\"%NUGETCONFIG%\" /p:RestorePackagesConfig=true /p:RestoreNoCache=true"
+            }
+        }
+        stage('execute-tfsbuildtool-step:startbuild') {
+            steps {
+                bat "\"%SOURCES_DIRECTORY%\\Source\\DLLs\\.NET\\Utilities\\TFSBuildTool\\bin\\Release\\TFSBuildToolCLI.exe\" /Step:StartBuild /RootPath:\"${env.WORKSPACE}\" /BuildNumber:\"${buildNumber}\" /WorkspaceName:\"%WORKSPACE_NAME%\" /BuildURI:\"vstfs:///Build/Build/357099\" /BuildVersion:\"2022\" /NugetExeToolPath:\"%NUGET%\" /DeployScriptDays:${DeployScriptDays} /DisableAspNetCompiler:\"%DisableAspNetCompiler%\" /DisableSQLScriptsCheckin:\"%DisableSQLScriptsCheckin%\" /Verbosity:\"Minimal\" /MSBuildNugetRestore:false /JenkinsJob:true /TFSServiceAccountUserName:%HMX_TFSBuild_NoDomain_USR% /TFSServiceAccountPassword:%HMX_TFSBuild_NoDomain_PSW% /TFSServiceAccountDomain:NTST /Clean"
+            }
+        }
+        stage('execute-dotnet-unit-tests') {
+            steps {
+                script{
+                    def includeFilter = '*test.unit*.dll';
+                    def excludeFilter = '*Test.Unit.JavaScript.dll';
+                    def customAdapterPath = "${env.WORKSPACE}\\b\\AutoBuild Solution\\";
+                    def settingsFile = "${env.WORKSPACE}\\s\\Source\\Tests\\test.runsettings";
+                    def searchPath = "${env.WORKSPACE}\\b";
+                    def resultsPath = "${env:WORKSPACE}\\TestResults";
+
+                    def result = powershell(returnStatus: true, script: """s\\Source\\Scripts\\RunVSTest.ps1 -vsTestLocation "${ VSTEST_PATH }" -searchFolder "${ searchPath }" -customAdaptersPath "${ customAdapterPath }" -settingsFile "${ settingsFile }" -includeFilter ${includeFilter} -excludeFilter ${excludeFilter} -resultsPath "${ resultsPath }" """);
+                    println "result ${result}"
+
+                    archiveArtifacts artifacts: "TestResults/*.trx",
+                    onlyIfSuccessful: false;
+
+                    if (result != 0) {
+                        powershell(returnStdout: true, script: """s\\Source\\Scripts\\GetVSTestFailures.ps1 -trxPath "${ resultsPath }" """);
+                    }
+                }
+            }
+        }
+        stage('execute-javascript-tests') {
+            steps {
+                script{
+                    def includeFilter = '*.ts';
+                    def customAdapterPath = "${env.NUGET_PACKAGES}\\chutzpah\\4.4.4\\tools";
+                    def searchPath = "${env.WORKSPACE}\\s\\Source\\Tests\\Unit\\Test.Unit.JavaScript\\Tests";
+                    def resultsPath = "${env:WORKSPACE}\\TestResults";
+
+                    def result = powershell(returnStatus: true, script: """s\\Source\\Scripts\\RunVSTest.ps1 -vsTestLocation "${ VSTEST_PATH }" -searchFolder "${ searchPath }" -customAdaptersPath "${ customAdapterPath }" -includeFilter ${includeFilter} -resultsPath "${ resultsPath }" """);
+                    println "result ${result}"
+
+                    archiveArtifacts artifacts: "TestResults/*.trx",
+                    onlyIfSuccessful: false;
+
+                    if (result != 0) {
+                        powershell(returnStdout: true, script: """s\\Source\\Scripts\\GetVSTestFailures.ps1 -trxPath "${ resultsPath }" """);
+                    }
+                }
+            }
+        }
+        stage('execute-tfsbuildtool-step:finishbuild') {
+            steps {
+                bat "\"%SOURCES_DIRECTORY%\\Source\\DLLs\\.NET\\Utilities\\TFSBuildTool\\bin\\Release\\TFSBuildToolCLI.exe\" /Step:FinishBuild /RootPath:\"${env.WORKSPACE}\" /BuildNumber:\"${buildNumber}\" /WorkspaceName:\"%WORKSPACE_NAME%\" /BuildURI:\"vstfs:///Build/Build/357099\" /BuildVersion:\"2022\" /NugetExeToolPath:\"%NUGET%\" /BootstrapperRootPath:\"%Bootstrapper_Path%\" /Verbosity:\"Minimal\" /Clean"
+            }
+        }
+        stage('copy-aws-files-to-artifact-folder') {
+            steps {
+                script {
+                    //get db scripts and zip
+                    powershell(returnStatus: true, script: """
+                        \$binariesScriptsPath = "${env.WORKSPACE}\\b\\Scripts"
+                        \$dbPath = "\$binariesScriptsPath\\*consolidated*.sql"
+                        \$dbupgradeZipName = '${dbArtifactName}'
+                        \$zipDestPath = "${env.WORKSPACE}\\a\\\$dbupgradeZipName"
+                        
+                        Write-Host "Creating \$zipDestPath";
+                        Compress-Archive -Path \$dbPath -DestinationPath \$zipDestPath -Force -CompressionLevel Optimal
+                    """)
+
+                    //copy docker and ebs files
+                    bat("xcopy \"${env.WORKSPACE}\\s\\Source\\Deploy\"  \"${env.WORKSPACE}\\a\\Source\\Deploy\" /I /O /X /E /y")
+
+                    //copy files needed for integration testing                    
+                    bat("xcopy \"${env.WORKSPACE}\\b\\AutoBuild Solution\"  \"${env.WORKSPACE}\\testdependencies\\AutoBuild Solution\" /I /O /E /X /y")                    
+                    bat("echo f|xcopy \"${env.WORKSPACE}\\s\\Source\\Tests\\test.runsettings\"  \"${env.WORKSPACE}\\testdependencies\\test.runsettings\" /I /O /X /E /y")
+                    bat("echo f|xcopy \"${env.WORKSPACE}\\s\\Source\\Tests\\.CommonLinkedFiles\\app.config\"  \"${env.WORKSPACE}\\testdependencies\\.CommonLinkedFiles\\app.config\" /I /O /X /E /y")
+
+                }
+            }
+        }
+        stage('upload-to-s3') {
+            steps {
+                script {
+                    if (UploadArtifactsToS3.toBoolean()) {
+                        zip archive: false, dir: 'a', glob: '', zipFile: outputZipName, overwrite: true, exclude: "**/${dbArtifactName}"
+                        zip archive: false, dir: testFilesDirName, glob: '', zipFile: testFilesZipName, overwrite: true
+
+                        s3Upload(file: "a/${dbArtifactName}", bucket: "${AWSS3Bucket}", path: "BuildOutputs/${JOB_BASE_NAME}/${BUILD_NUMBER}/${dbArtifactName}")
+                        s3Upload(file: outputZipName, bucket: "${AWSS3Bucket}", path: "BuildOutputs/${JOB_BASE_NAME}/${BUILD_NUMBER}/${outputZipName}")
+                        s3Upload(file: testFilesZipName, bucket: "${AWSS3Bucket}", path: "BuildOutputs/${JOB_BASE_NAME}/${BUILD_NUMBER}/${testFilesZipName}")
+                    }
+                }
+            }
+        }
+        stage('post-build-cleanup') {
+            steps {
+                script {
+                    def pendingchanges = bat(returnStdout: true, script: "%TF% stat /workspace:\"%WORKSPACE_NAME%;${HMX_TFSBuild_USR}\" /collection:${tfsServerURL} /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW%").readLines().join(" ")
+                    if (!pendingchanges.contains('There are no pending changes.')) {
+                        println "undo any pending changes..."
+                        bat "%TF% vc undo /recursive \"%SOURCES_DIRECTORY%\" /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW% /noprompt"
+                    } else {
+                        println "No pending changes..."
+                    }
+                }
+            }
+        }
+    }
+    post {
+        success {
+                build job: 'execute-mubo-integration-tests', parameters: [
+                string(name: 'ParentBuildName', value: "${JOB_BASE_NAME}"),
+                string(name: 'ParentBuildNumber', value: "${BUILD_NUMBER}")
+            ], wait: false
+
+            build job: 'create-and-push-artifacts-for-deployment', parameters: [
+                string(name: 'ParentBuildName', value: "${JOB_BASE_NAME}"),
+                string(name: 'ParentBuildNumber', value: "${BUILD_NUMBER}")
+            ], wait: false
+
+        }
+        //always {
+        //        archiveArtifacts artifacts: "TestResults/*.trx",
+        //        onlyIfSuccessful: false;
+        //}
+    }
+}

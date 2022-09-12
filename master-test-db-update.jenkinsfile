@@ -1,0 +1,135 @@
+String serverPath = "\$/HMX/Archive/Consolidated Scripts";
+String tfsServerURL = "https://dev-ltctfs.ntst.com/myUnityCollection/";
+
+pipeline {
+    agent { label 'msbuild' }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '1'))
+    }
+    environment {
+        SOURCES_DIRECTORY = "${env.WORKSPACE}\\s";
+        WORKSPACE_NAME = "Jenkins-${JOB_NAME}-${env.NODE_NAME}".replaceAll(~/\s/, "");
+        TF = '"C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools\\Common7\\IDE\\CommonExtensions\\Microsoft\\TeamFoundation\\Team Explorer\\TF.exe"';
+        HMX_TFSBuild = credentials('HMX_TFSBuild');
+    }
+    stages {
+        
+        stage('checkout-source-code') {
+            steps {
+                script {
+                    Boolean cleaned = false;
+                    String wsName = "%WORKSPACE_NAME%"
+                    Boolean wsExists;
+
+                    //set the mappings
+                    def mappings = ["${serverPath}": "%SOURCES_DIRECTORY%"]
+                    def cloakings = ["${serverPath}/8.1", "${serverPath}/8.2", "${serverPath}/8.3", "${serverPath}/8.4", "${serverPath}/8.5", "${serverPath}/9.0", "${serverPath}/9.1", "${serverPath}/9.2", "${serverPath}/9.3", "${serverPath}/SqlScripts", "${serverPath}/Consolidated HMXMeta Update Script_Deploy.sql", "${serverPath}/Consolidated Client Secure Update Script_Deploy.sql", "${serverPath}/Consolidated OLTP Update Script_Deploy.sql", "${serverPath}/Consolidated WCMeta Update Script_Deploy.sql", "${serverPath}/Consolidated WCSecure Update Script_Deploy.sql"];
+                    def wsExistsOut;
+                    try {
+                        println "Checking if workspace exists...";
+                        def cmdExitCode;
+                        cmdExitCode = bat(returnStdout: true, returnStatus: true, script: "%TF% workfold /collection:${tfsServerURL} /workspace:${wsName} /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW%")
+                        if (cmdExitCode == 100) {
+                            println "Workspace did not exist."
+                            wsExists = false;
+                            cleanWS = false;
+                        } else {
+                            wsName = "${WORKSPACE_NAME}"
+                            println "Workspace exists: ${wsName}"
+                            wsExists = true;
+                            cleanWS = true;
+                        }
+                    } catch (Exception e) {
+                        def msg = e.getMessage();
+                        println "msg: ${msg}";
+                        error("msg: ${msg}");
+                    }
+                    Boolean cleanWS = Clean_TFS_Workspace.toBoolean();
+                    println "Clean_TFS_Workspace: ${cleanWS}"
+
+                    //if it doesn't exist or delete it if we want to clean
+                    if (wsExists && cleanWS) {
+                        println "Attempting to clean ${env.WORKSPACE}"
+                        cleanWs(); //clean the workspace folder                        
+                        bat "%TF% vc workspace /delete ${wsName};${HMX_TFSBuild_USR} /collection:${tfsServerURL} /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW% /noprompt"
+                        cleaned = true;
+                    }
+
+                    //if the workspace doesn't exist or it was cleaned create it.
+                    if (!wsExists || cleaned) {
+                        println "Creating new workspace..."
+                        //bat "%TF% workspace /new ${wsName};${HMX_TFSBuild_USR} /collection:${tfsServerURL} /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW% /noprompt"
+                        bat(returnStdout: true, script: "%TF% workspace /new ${wsName};${HMX_TFSBuild_USR} /collection:${tfsServerURL} /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW% /noprompt").readLines().drop(1).join(" ")
+                        bat "%TF% vc workfold /unmap /workspace:${wsName} \$/ /collection:${tfsServerURL} /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW% /noprompt"
+                        println "Creating new workspace mappings..."
+                        mappings.each{ server, local -> bat "%TF% vc workfold /map /workspace:\"${wsName}\" \"${server}\" \"${local}\" /collection:${tfsServerURL} /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW% /noprompt" };
+                        cloakings.each { bat "%TF% vc workfold /cloak /workspace:${wsName} \"${it}\" /collection:${tfsServerURL} /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW% /noprompt" };
+                    }
+
+                    //if we didnt change the workspace check for pending changes and undo if any.
+                    if (wsExists && !cleaned) {
+                        //def pendingchanges = bat (returnStdout: true, script: "@echo off && %TF% stat /workspace:\"${wsName};${HMX_TFSBuild_USR}\" /collection:${tfsServerURL} /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW% && echo %ERRORLEVEL%").readLines().join(" ")
+                        def pendingchanges = bat(returnStdout: true, script: "@echo off && %TF% stat /workspace:\"${wsName};${HMX_TFSBuild_USR}\" /collection:${tfsServerURL} /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW%").readLines().join(" ")
+                        if ('There are no pending changes'.equalsIgnoreCase(pendingchanges)) {
+                            println "undo any pending changes..."
+                            bat "%TF% vc undo /recursive \"%SOURCES_DIRECTORY%\" /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW% /noprompt"
+                        }
+                    }
+
+                    //get from source
+                    bat "%TF% get \"%SOURCES_DIRECTORY%\" /recursive /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW% /version:${Source_Version} /noprompt"
+                }
+            }
+        }
+        stage("update-databases") {
+            steps {
+                script {
+                    
+                    println 'Updating databases...'
+                    def out = powershell(returnStdout: true, script: """  
+                    
+                        \$sourcesPath = "${env.WORKSPACE}\\s"
+                    
+                        Function UpdateDB {
+                            param(
+                                \$dbSvr,
+                                \$dbName,
+                                \$dbScriptPath
+                            )
+                        
+                            sqlcmd -S \$dbSvr -d \$dbName -i "\$dbScriptPath" -U "${SQLUserName}" -P "${SQLUserName}"
+                        }
+                    
+                            #update dev-arch oltp master.
+                            #UpdateDB -dbSvr "${SQLServerName}" -dbName "${Dev_Arch_OLTP_DB_Name}" -dbScriptPath "\$sourcesPath\\${Dev_Arch_BranchPath}\\${Dev_Arch_OLTP_FileName}"
+
+                            #update dev oltp master.
+                            UpdateDB -dbSvr "${SQLServerName}" -dbName "${Dev_OLTP_DB_Name}" -dbScriptPath "\$sourcesPath\\${Dev_BranchPath}\\${Dev_OLTP_FileName}"
+                            
+                            #update nextrelease oltp master
+                            UpdateDB -dbSvr "${SQLServerName}" -dbName "${Rel_OLTP_DB_Name}" -dbScriptPath "\$sourcesPath\\${Rel_BranchPath}\\${Rel_OLTP_FileName}"
+
+                            #add additional databases here...
+
+                            
+                    """);
+                    
+                    println out
+                }
+            }
+        }
+        stage('post-build-cleanup') {
+            steps {
+                script {
+                    def pendingchanges = bat(returnStdout: true, script: "%TF% stat /workspace:\"%WORKSPACE_NAME%;${HMX_TFSBuild_USR}\" /collection:${tfsServerURL} /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW%").readLines().join(" ")
+                    if (!pendingchanges.contains('There are no pending changes.')) {
+                        println "undo any pending changes..."
+                        bat "%TF% vc undo /recursive \"%SOURCES_DIRECTORY%\" /login:%HMX_TFSBuild_USR%,%HMX_TFSBuild_PSW% /noprompt"
+                    } else {
+                        println "No pending changes..."
+                    }
+                }
+            }
+        }
+    }
+}

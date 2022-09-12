@@ -1,0 +1,212 @@
+import groovy.json.JsonSlurper
+
+awsRegion = "${AWSRegion}"
+s3Bucket = "${AWSS3Bucket}"
+
+def imgs = [
+    guardiant: 'myunity-bo-svc-guardiant_collector',
+    hl7: 'myunity-bo-svc-hl7',
+    inbound: 'myunity-bo-svc-interop_inbound',
+    outbound: 'myunity-bo-svc-interop_outbound',
+    jobSchedular: 'myunity-bo-svc-job_scheduler',
+    remcomm: 'myunity-bo-svc-remote_comm_agent',
+    telephony: 'myunity-bo-svc-telephony',
+    workflow: 'myunity-bo-svc-workflow',
+    offlineMtf: 'myunity-bo-svc-offline_mtf'
+    //audit: 'myunity-bo-svc-audit',
+    //filebeat: 'myunity-bo-svc-filebeat'
+]
+
+def checkoutService(gitRepo, gitBranch) {
+    //bitbucket account id from jenkins
+    def git_credentials_id = "bitbucket_bbcloudapi"
+    def gitBranchParameter = "${gitBranch}".toString()
+    checkout([$class: 'GitSCM',
+          branches: [[name: "${gitBranchParameter}"]],
+          doGenerateSubmoduleConfigurations: false,
+          submoduleCfg: [],
+          userRemoteConfigs: [[url: "https://bitbucket.org/ntsttech/${gitRepo}.git", credentialsId: "${git_credentials_id}"]],
+         ])
+}
+
+def uploadArtifactsToS3(webAppFileName, bootstrapperFileName, dbUpgradeFileName, crmFileWatcherFileName) {
+    withAWS(region: awsRegion) {
+        echo "Uploading content with AWS creds";
+        echo "Uploading ${webAppFileName}";
+        s3Upload(pathStyleAccessEnabled: true,
+            payloadSigningEnabled: true,
+            includePathPattern: "web\\myunity-backoffice\\${webAppFileName}",
+            workingDir: "ntst-artifactory-promoted-web",
+            bucket: "${s3Bucket}")
+        echo "Uploading ${bootstrapperFileName}";
+        s3Upload(pathStyleAccessEnabled: true,
+            payloadSigningEnabled: true,
+            includePathPattern: "web\\myunity-backoffice\\${bootstrapperFileName}",
+            workingDir: "ntst-artifactory-promoted-web",
+            bucket: "${s3Bucket}")
+        echo "Uploading ${dbUpgradeFileName}";
+        s3Upload(pathStyleAccessEnabled: true,
+            payloadSigningEnabled: true,
+            includePathPattern: "database\\upgrade\\${dbUpgradeFileName}",
+            workingDir: "ntst-artifactory-promoted-web",
+            bucket: "${s3Bucket}")
+        echo "Uploading ${crmFileWatcherFileName}";
+        s3Upload(pathStyleAccessEnabled: true,
+            payloadSigningEnabled: true,
+            includePathPattern: "web\\myunity-backoffice\\${crmFileWatcherFileName}",
+            workingDir: "ntst-artifactory-promoted-web",
+            bucket: "${s3Bucket}")
+    }
+}
+
+def cleanUpArtifacts(localFolder, scriptName) {
+    //Tis will go delete the files from the Jenkins Node
+    powershell(returnStdout: true, script: """
+        Using module \"${ENV:WORKSPACE}\\Powershell\\mubo_core.psm1\";
+        
+        function Invoke-CleanUpArtifacts {
+            & (Get-ScriptDirectory -PostPath \"${ENV:WORKSPACE}\\Powershell\\""" + scriptName + """\") `
+                -LocalFolder \"""" + localFolder + """\";
+        }
+        
+        function Main {
+            Invoke-CleanUpArtifacts;
+        }
+        
+        Main
+     """)
+}
+
+pipeline {
+    agent none
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '1'))
+    }
+    
+    stages {
+    
+        stage('clean-workspace') {
+            agent {label 'msbuild'}
+            steps {
+                // Clean before build
+                cleanWs()
+            }
+        }
+        stage('checkout-source-code') {
+            agent {label 'msbuild'}
+            // checkout from git
+            steps {
+                checkoutService("${git_repo}","${git_branch}")
+            }
+        }
+        stage('Get Artifacts From Artifactory') {
+            agent {label 'msbuild'}
+            environment {
+                targetVersion = "${Target_Version}"
+            }
+            steps {
+                rtDownload (
+                   serverId: "artifactory-cloud",
+                   failNoOp: true,
+                   spec:
+                       """{
+                       "files": [
+                           {
+                           "pattern": "myunity-backoffice-local/web/myunity-backoffice/ebs-web-app_${targetVersion}.zip",
+                           "target": "ntst-artifactory-promoted-web\\"
+                           },
+                           {
+                           "pattern": "myunity-backoffice-local/web/myunity-backoffice/ebs-web-bootstrapper_${targetVersion}.zip",
+                           "target": "ntst-artifactory-promoted-web\\"
+                           },
+                           {
+                           "pattern": "myunity-backoffice-local/database/upgrade/dbupgrade_${targetVersion}.zip",
+                           "target": "ntst-artifactory-promoted-web\\"
+                           },
+                           {
+                           "pattern": "myunity-backoffice-local/web/myunity-backoffice/crm-filewatcher_${targetVersion}.zip",
+                           "target": "ntst-artifactory-promoted-web\\"
+                           }
+                       ]
+                       }"""
+                )
+            }
+        }
+        stage('Get Images From Artifactory') {
+            agent {label 'Linux'}
+            environment {
+                targetVersion = "${Target_Version}"
+            }
+            steps {
+                echo "Pulling docker images";
+                script {
+                    withCredentials([usernamePassword(credentialsId: '1bdf09fd-d601-40f8-bdc8-f2ac0fa6f2d0', passwordVariable: 'JFROG_PWD', usernameVariable: 'JFROG_USER')]) {
+                        sh "docker login -u ${JFROG_USER} -p ${JFROG_PWD} ntst.jfrog.io"
+                        imgs.each { img ->
+                            echo "Pulling ${img.value} local"
+                            sh "docker pull ntst.jfrog.io/myunity-backoffice-docker-local/${img.value}:${targetVersion}"
+                        }
+                        sh "docker logout ntst.jfrog.io"
+                    }
+                }
+            }
+        }
+        stage('retag-images') {
+            agent {label 'Linux'}
+            steps {
+                //Retag them
+                echo "Retagging images";
+                script {
+                    imgs.each { img ->
+                        sh "docker tag ntst.jfrog.io/myunity-backoffice-docker-local/${img.value}:${Target_Version} ${AWSAccount}.dkr.ecr.${AWSRegion}.amazonaws.com/${img.value}:${Target_Version}"
+                    }
+                }
+            }
+        }
+        stage ('Upload Artifacts to AWS'){
+            agent {label 'msbuild'}
+            environment {
+                targetVersion = "${Target_Version}"
+            }
+            steps {
+                uploadArtifactsToS3("ebs-web-app_${targetVersion}.zip", "ebs-web-bootstrapper_${targetVersion}.zip", "dbupgrade_${targetVersion}.zip", "crm-filewatcher_${targetVersion}.zip")
+            }
+        }
+        stage ('Push images to AWS') {
+            agent {label 'Linux'}
+            environment {
+                targetVersion = "${Target_Version}"
+            }
+            steps {
+                echo "pushing images to ECR";
+                script {
+
+                    docker.withRegistry("${DockerRegistryURL}", "ecr:${AWSRegion}:myUnityAutomation") {
+                        imgs.each { img ->
+                                docker.image("${AWSAccount}.dkr.ecr.${AWSRegion}.amazonaws.com/${img.value}:${targetVersion}").push()
+                        }
+                    }
+                }
+            }
+        }
+        stage('cleanup-artifacts') {
+            agent {label 'msbuild'}
+            steps {
+                cleanUpArtifacts("${ENV:WORKSPACE}\\ntst-artifactory-promoted-web\\web\\myunity-backoffice", "cleanup-promoted-artifacts.ps1")
+                cleanUpArtifacts("${ENV:WORKSPACE}\\ntst-artifactory-promoted-web\\database\\upgrade", "cleanup-promoted-artifacts.ps1")
+            }
+        }
+        stage('cleanup-images') {
+            agent {label 'Linux'}
+            steps {
+                echo "Cleaning up images";
+                script {
+                    imgs.each { img ->
+                        sh "docker rmi ntst.jfrog.io/myunity-backoffice-docker-local/${img.value}:${Target_Version}"
+                        sh "docker rmi ${AWSAccount}.dkr.ecr.${AWSRegion}.amazonaws.com/${img.value}:${Target_Version}"
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,236 @@
+import groovy.json.JsonSlurper
+
+if (env.JENKINS_URL.contains('myunity-bo-prod-jenkins')) {
+    prod_automatic_patch_tag = "general-prod"
+    nonprod_automatic_patch_tag = "general-dev"
+    prod_patch_group_tag = "general-windows-prod"
+    nonprod_patch_group_tag = "general-windows-dev"
+    cost_center = "2016 Hosting - Post Acute"
+}
+else if (env.JENKINS_URL.contains('myunity-bo-test-jenkins')){
+    prod_automatic_patch_tag = "general-dev"
+    nonprod_automatic_patch_tag = "general-dev"
+    prod_patch_group_tag = "general-windows-dev"
+    nonprod_patch_group_tag = "general-windows-dev"
+    cost_center = "5027 RD - myUnity Homecare and Hospice"
+}
+else{
+    error("Unknown Jenkins instance... Exiting")
+}
+
+def checkoutService(gitRepo, gitBranch) {
+    //bitbucket account id from jenkins
+    def git_credentials_id = "bitbucket_bbcloudapi"
+    def gitBranchParameter = "${gitBranch}".toString()
+    checkout([$class: 'GitSCM',
+          branches: [[name: "${gitBranchParameter}"]],
+          doGenerateSubmoduleConfigurations: false,
+          submoduleCfg: [],
+          userRemoteConfigs: [[url: "https://bitbucket.org/ntsttech/${gitRepo}.git", credentialsId: "${git_credentials_id}"]],
+         ])
+}
+
+def parameters
+
+def getParameters() {
+    def result = powershell(returnStdout: true, script: "aws ssm get-parameter --name \"/myUnity/Config/Stack_${StackId}/1.0/json\" --with-decryption --query \"Parameter.Value\" --output text")    
+    parameters = readJSON text: result
+    println result
+}
+
+def rebuildStack() {
+    
+    def output = powershell(returnStdout: true, script: """
+        Using module \"${ENV:WORKSPACE}\\Powershell\\mubo_core.psm1\";
+     
+        \$StackProperties = [StackProperties]::new(
+            <# [String]\$stackID #>'${parameters.stack_id}',
+            <# [String]\$region #>'${parameters.aws_region}',
+            <# [String[]]\$clusterSecurityGroup #>@('${parameters.aws_security_group_fargate}'),
+            <# [String]\$taskRoleNameParameter #>'${parameters.aws_role_ECS_Execution}',
+            <# [String]\$targetVersion #>'${TargetVersion}',
+            <# [String]\$description #>'test', <#This value does not appear to get used by cloud formation when creating the app stack#>
+            <# [String]\$environmentType #>'${parameters.environment_type}',
+            <# [String]\$VpcIdParameter #>'${parameters.aws_vpc}',
+            <# [String[]]\$PublicSubnetsParameter #>@(${parameters.aws_public_subnets}),
+            <# [String[]]\$PrivateSubnetsParameter #>@(${parameters.aws_private_subnets}),
+            <# [String]\$LbCertArnParameter #>'${parameters.aws_load_balancer_cert_arn}',
+            <# [String[\$DisableRollback #>\$True,
+            <# [String[\$AppELBSecurityGroupParameter #>@('${parameters.aws_elastic_load_balanced_security_group}'),
+            <# [String[\$AppSecurityGroupParameter #>@('${parameters.aws_app_security_group}'),
+            <# [String[\$BastionHostSecurityGroupParameter #>@('${parameters.aws_bastion_host_security_group}'),
+            <# [String]\$DB_Name #>'${parameters.DB_Name}',
+            <# [String]\$Application #>'myUnity',
+            <# [String]\$ResourceType #>'Application',
+            <# [String]\$CostCenter #>'${cost_center}'
+        );
+		
+        \$StackProperties.AutomaticPatches = '${prod_automatic_patch_tag}';
+        \$StackProperties.PatchGroup = '${prod_patch_group_tag}';
+
+        \$stackID=\$StackProperties.StackID;
+        \$region=\$StackProperties.Region;
+
+
+        \$ErrorActionPreference = 'Stop';
+
+        function Main {
+
+            \$stackPrefix = 'mubo-web';
+            \$applicationName="\$StackPrefix-\$(\$StackProperties.StackID)-app-\$(\$StackProperties.Region)-\$(\$StackProperties.EnvironmentType)";
+
+            #get the current ebenvironment pointed at back
+            \$eb_environment = Get-EBEnvironment -region \$region  `
+                -ApplicationName \$applicationName | Where-Object {\$_.Status -ne 'Terminated' -and \$_.CNAME -like "*-\$(\$StackProperties.StackID)-back*" };
+            
+            if(\$eb_environment) { #if we find it delete.
+                #get the cloudformation stack based on the eb environment returned above.
+                if(\$eb_environment.EnvironmentName.EndsWith("1")){
+                    \$stackName = "mubo-web-\$stackID-env-front-stack"
+                    \$environmentIndex = 1;
+                }else{
+                    \$stackName = "mubo-web-\$stackID-env-back-stack"
+                    \$environmentIndex = 2;
+                }
+
+                write-host "Preparing to delete and rebuild the following: Stack- \$stackName, ELB Environment- \$(\$eb_environment.EnvironmentName) with CNAME- \$(\$eb_environment.CNAME)"
+                Delete-Stack `
+                    -stackName \$stackName `
+                    -region \$region;
+
+            } else { #if we didn't find the environment figure out what stack has front cname and set the variables opposite so it will be created.
+                \$eb_environment = Get-EBEnvironment -region \$region  `
+                -ApplicationName \$applicationName | Where-Object {\$_.Status -ne 'Terminated' -and \$_.CNAME -like "*-\$(\$StackProperties.StackID)-front*" };
+
+                if(\$eb_environment.EnvironmentName.EndsWith("1")){
+                    \$stackName = "mubo-web-\$stackID-env-back-stack"
+                    \$environmentIndex = 2;
+                }else{
+                    \$stackName = "mubo-web-\$stackID-env-front-stack"
+                    \$environmentIndex = 1;
+                }
+
+            }
+
+
+            \$stackPrefix = 'mubo-web';
+
+
+            Create-EbstalkEnvironment `
+                -StackPrefix \$stackPrefix `
+                -ApplicationName \$eb_environment.ApplicationName `
+                -EnvironmentIndex \$environmentIndex `
+                -StackProperties \$StackProperties;
+            
+        }
+
+        function Delete-Stack {
+            param(
+                [Parameter(Mandatory=\$true)][String]\$stackName,
+                [Parameter(Mandatory=\$true)][String]\$region
+            )
+                if (Test-CFNStack -StackName \$stackName -Region \$region) {
+                    Write-Host "Deleting stack \$stackName.";
+                    Remove-CFNStack -StackName \$stackName -Region \$region -Force;
+                    Wait-CFNStack -StackName \$stackName -region \$region -Status DELETE_COMPLETE -Timeout 900 ;
+                    Write-Host "Deleting stack '\$stackName' complete.";
+                } else {
+                    Write-Host "Stack \$stackName was not found...";
+                }
+        }
+
+        function Create-EbstalkEnvironment{
+            param(
+                [Parameter(Mandatory=\$true)][String]\$StackPrefix,
+                [Parameter(Mandatory=\$true)][String]\$ApplicationName,
+                [Parameter(Mandatory=\$true)][ValidateSet(1, 2)][Int]\$EnvironmentIndex,
+                [Parameter(Mandatory=\$true)][StackProperties]\$StackProperties
+            )
+
+            \$templateBody = (Get-TemplateBodyRaw -TemplateName 'ebstalk-create-environment-backoffice-web.yaml');
+            \$cnameBack = 'back'; #always set the cname to back. We shouldn't be deleting and recreating the environment that currently has the front cname.
+            
+            if (\$EnvironmentIndex -eq 1) { 
+                \$EnvCnameSuffix = 'front';
+            } elseif (\$EnvironmentIndex -eq 2) { 
+                \$EnvCnameSuffix = 'back';
+            } else {
+                Write-Error "[EbstalkEnvironment] EnvironmentIndex does not have an implemented Cname suffix.";
+            }
+
+            \$vpcName = (Get-EC2Vpc -VpcId \$(\$StackProperties.VpcIdParameter)).Tags | ? { \$_.key -eq "name" } | select -expand Value;
+
+            \$stackName="\$StackPrefix-\$(\$StackProperties.StackID)-env-\$EnvCnameSuffix-stack";
+            Write-Host "[EbstalkEnvironment] Creating Environment Stack \$StackName Cname: \$cnameBack for application \$ApplicationName";
+            if (-Not (Test-CFNStack -StackName \$stackName -Region \$region)) {
+                New-CFNStack -StackName "\$stackName" `
+                        -TemplateBody \$templateBody `
+                        -Parameter @( 
+                        @{ ParameterKey="Application"; ParameterValue="\$(\$StackProperties.Application)_web" },
+                        @{ ParameterKey="Environment"; ParameterValue="\$(\$StackProperties.EnvironmentType)" },
+                        @{ ParameterKey="CostCenter"; ParameterValue="\$(\$StackProperties.CostCenter)" },
+                        @{ ParameterKey="ResourceName"; ParameterValue="ebs-env" },
+                        @{ ParameterKey="ResourceType"; ParameterValue="\$(\$StackProperties.ResourceType)" },
+                        @{ ParameterKey="EBStalkApplicationNameParameter"; ParameterValue="\$ApplicationName" }, 
+                        @{ ParameterKey="StackIDParameter"; ParameterValue=\$StackProperties.StackID },
+                        @{ ParameterKey="EnvironmentIndexParameter"; ParameterValue="\$EnvironmentIndex" },
+                        @{ ParameterKey="EnvironmentCnameSuffixParameter"; ParameterValue="\$cnameBack" }, #always set the cname to back.
+                        @{ ParameterKey="VpcIdParameter"; ParameterValue=\$StackProperties.VpcIdParameter },
+                        @{ ParameterKey="PublicSubnetsParameter"; ParameterValue="\$([String]::Join(',', \$StackProperties.PublicSubnetsParameter))" },
+                        @{ ParameterKey="PrivateSubnetsParameter"; ParameterValue="\$([String]::Join(',', \$StackProperties.PrivateSubnetsParameter))" },
+                        @{ ParameterKey="LbCertArnParameter"; ParameterValue=\$StackProperties.LbCertArnParameter },
+                        @{ ParameterKey="AppELBSecurityGroupParameter"; ParameterValue="\$([String]::Join(',', \$StackProperties.AppELBSecurityGroupParameter))" },
+                        @{ ParameterKey="AppSecurityGroupParameter"; ParameterValue="\$([String]::Join(',', \$StackProperties.AppSecurityGroupParameter))" },
+                        @{ ParameterKey="BastionHostSecurityGroupParameter"; ParameterValue="\$([String]::Join(',', \$StackProperties.BastionHostSecurityGroupParameter))" },
+                        @{ ParameterKey="AutomaticPatches"; ParameterValue=\$StackProperties.AutomaticPatches },
+                        @{ ParameterKey="PatchGroup"; ParameterValue=\$StackProperties.PatchGroup },
+                        @{ ParameterKey="EC2KeyNameParam"; ParameterValue=\$vpcName }
+                        ) `
+                        -DisableRollback \$true `
+                        -Region \$region;
+                Wait-CFNStack -StackName \$stackName -Status CREATE_COMPLETE -Timeout \$(30  * 60) -Region \$region;
+                \$msg = "Success creating Ebstalk Application \$EnvCnameSuffix stack environment.";
+            } else {
+                \$msg = "Ebstalk Application \$EnvCnameSuffix stack environment exists.";
+            }
+            Write-Host \$msg;
+        }
+
+
+        Main;
+    """)
+
+    println output
+}
+
+pipeline {
+    agent { label 'msbuild' }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '1'))
+    }
+    stages {
+        stage('clean-workspace') {
+            steps {
+                // Clean before build
+                cleanWs()
+            }
+        }
+        stage('checkout-source-code') {
+            // checkout from git
+            steps {
+                checkoutService("${git_repo}","${git_branch}")
+            }
+        }
+        stage('get-paramstore-parameters') {
+            steps {
+                getParameters()
+            }
+        }
+        stage('deploy-mubo-web')
+        {
+            steps {
+               rebuildStack()
+            }
+        }
+    }
+}

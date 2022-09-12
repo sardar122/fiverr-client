@@ -1,0 +1,183 @@
+#!/usr/bin/env groovy
+if (env.JENKINS_URL.contains('myunity-bo-prod-jenkins')) {
+    environmentA = "prod"
+    environmentB = "uat"
+    cost_center  = "2016 Hosting - Post Acute"
+}
+else if (env.JENKINS_URL.contains('myunity-bo-test-jenkins')){
+    environmentA = "qa"
+    environmentB = "dev"
+    cost_center  = "5027 RD - myUnity Homecare and Hospice"
+}
+else{
+    error("Unknown Jenkins instance... Exiting")
+}
+
+if ( Region == 'us-east-2' ){ commvault_cidr_block = "10.66.20.0/22"; esm_services_cidr_block = "10.65.228.0/22"; }
+else if ( Region == 'us-west-2' ) { commvault_cidr_block = ""; esm_services_cidr_block = "" }
+else{ error("Unknown Region... Exiting") }
+
+def checkoutService(gitRepo, gitBranch) {
+    //bitbucket account id from jenkins
+    echo "Pulling source repo: ${gitRepo}"
+    echo "Branch: ${gitBranch}"
+    def git_credentials_id = "bitbucket_bbcloudapi"
+    def gitBranchParameter = "${gitBranch}".toString()
+    checkout([$class: 'GitSCM',
+          branches: [[name: "${gitBranchParameter}"]],
+          doGenerateSubmoduleConfigurations: false,
+          submoduleCfg: [],
+          userRemoteConfigs: [[url: "https://bitbucket.org/ntsttech/${gitRepo}.git", credentialsId: "${git_credentials_id}"]],
+    ])
+}
+
+node(label: 'msbuild'){
+    def workspace = "${env.WORKSPACE}"
+    def cfn_repo = "${workspace}\\cfn"
+
+    // checkout from git
+    stage("checkout-tools"){
+        dir("${cfn_repo}"){
+            checkoutService("mubo-devops", scm.branches[0].name)
+        }
+    }
+
+    stage("gather-info"){
+        dir("${cfn_repo}"){
+            if ("${environment}" == "prod"){
+                prefix = "${environmentA}"
+                resource_name_prefix = "p"
+                aoag = "true"
+            }
+            else{
+                prefix = "${environmentB}"
+                resource_name_prefix = "t"
+                aoag = "false"
+            }
+
+            service = "myunity"
+            iam_cfn_stack_name = "${prefix}-ec2-mssql-iam-multitenant"
+            sg_cfn_stack_name = "${prefix}-ec2-mssql-sg-multitenant"
+            sg_global_sql_platform_cfn_stack_name = "sg-ec2-global-sql-platform-${prefix}"
+
+            //ClientLongName        = bat (script: "@python Python\\get_ssm_parameter_value.py /clients/prod/${ClientId}-prod client_name ${Region}",returnStdout: true).trim() //To be Jenkins Parameter
+
+            vpc_id                  = bat (script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} ${service}-${prefix}-vpc VpcId",returnStdout: true).trim()
+            jenkins_host_sg         = bat (script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} ${service}-mgmt-jenkins-ecs-service HostsSG",returnStdout: true).trim()
+            jenkins_container_sg    = bat (script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} ${service}-mgmt-jenkins-ecs-service ServiceSG",returnStdout: true).trim()
+            dba_tooling_sg          = bat (script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} mubo-sg-ec2-dba-tools-mssql SecurityGroup",returnStdout: true).trim()
+
+            beanstalk_tools_secret_arn = bat (script: "@python \"${cfn_repo}\"\\Python\\get_secrets_manager_arn.py BeanstalkTools ${Region}",returnStdout: true).trim()
+            ansible_tools_secret_arn   = bat (script: "@python \"${cfn_repo}\"\\Python\\get_secrets_manager_arn.py AnsibleTools ${Region}",returnStdout: true).trim()
+            crm_sg                  = bat(script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} ${prefix}-ec2-crm-sg-multitenant CRMSecurityGroup", returnStdout: true).trim()
+
+            if (env.JENKINS_URL.contains('myunity-bo-prod-jenkins')) {
+                interregion_0_cidr      = "-"
+                ansible_sg              = bat(script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} ${service}-mgmt-ec2-ansible-0 AnsibleSG", returnStdout: true).trim()
+                bastion_sg              = bat(script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} ${service}-mgmt-bastion-app-rdp SecurityGroup", returnStdout: true).trim()
+                linux_bastion_sg        = "-"
+                scripts_sg              = "-" // removing this for now.  It is easier to add then remove TODO: Create a task to remove this from test and prod
+
+                beanstalk_sg = bat(script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} mubo-sg-${prefix}-elbeanstalk SecurityGroup", returnStdout: true).trim()
+                fargate_sg = bat(script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} mubo-sg-${prefix}-ecs-fargate SecurityGroup", returnStdout: true).trim()
+            }
+            else if (env.JENKINS_URL.contains('myunity-bo-test-jenkins')){
+                interregion_0_cidr      = "-"
+                ansible_sg = bat(script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} ${service}-mgmt-ec2-ansible AnsibleSG", returnStdout: true).trim()
+                bastion_sg              = bat (script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} ${service}-mgmt-bastion-windows-0 BastionSG",returnStdout: true).trim()
+            	linux_bastion_sg        = bat (script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} ${service}-mgmt-bastion-linux-0 BastionHostSG", returnStdout: true).trim()
+                scripts_sg              = bat (script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} mubo-mgmt-scripts-ec2 ScriptsSG", returnStdout: true).trim()
+		
+                // This is a workaround till we have time to recreate the dev fargate and beanstalk sg's.  The name did not include the prefix/environment type and cfn's cannot be renamed, so all the sg id will change.
+                if (prefix == 'dev') {
+                    beanstalk_sg    = bat(script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} mubo-sg-elbeanstalk SecurityGroup", returnStdout: true).trim()
+                    fargate_sg      = bat(script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} mubo-sg-ecs-fargate SecurityGroup", returnStdout: true).trim()
+                } else {
+                    beanstalk_sg = bat(script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} mubo-sg-${prefix}-elbeanstalk SecurityGroup", returnStdout: true).trim()
+                    fargate_sg = bat(script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} mubo-sg-${prefix}-ecs-fargate SecurityGroup", returnStdout: true).trim()
+                }
+            }
+        }
+    }
+
+    stage("deploy-mssql-ec2-iam-role"){
+        dir("${cfn_repo}"){
+            powershell """\
+                aws cloudformation deploy `
+                --no-fail-on-empty-changeset `
+                --stack-name \"${iam_cfn_stack_name}\" `
+                --template-file \"cloudformation\\20-Security\\ec2-sql-iam.yaml\" `
+                --capabilities CAPABILITY_IAM `
+                --region ${Region} `
+                --parameter-overrides `
+                \"Application=${service}\" `
+                \"Client=Multitenant\" `
+                \"ClientId=Multitenant\" `
+                \"ResourceName=${resource_name_prefix}vmuemdbw-iam\" `
+                \"AccountSecretsManagerArn0=${beanstalk_tools_secret_arn}\" `
+                \"AccountSecretsManagerArn1=${ansible_tools_secret_arn}\" `
+                \"CostCenter=${cost_center}\" `
+                \"ResourceType=Application\"""".stripIndent()
+        }
+    }
+
+    // At some point we need to go through this and the following sg and remove what is duplicated.  This one is tailored to myUnity.
+    stage("deploy-mssql-ec2-security-groups"){
+        dir("${cfn_repo}"){
+            powershell """\
+                aws cloudformation deploy `
+                --no-fail-on-empty-changeset `
+                --stack-name \"${sg_cfn_stack_name}\" `
+                --template-file \"cloudformation\\20-Security\\ec2-sql-sg.yaml\" `
+                --capabilities CAPABILITY_IAM `
+                --region ${Region} `
+                --parameter-overrides `
+                \"Application=${service}\" `
+                \"Client=Multitenant\" `
+                \"ClientId=Multitenant\" `
+                \"ResourceName=${resource_name_prefix}vmuemdbw-sg\" `
+                \"CostCenter=${cost_center}\" `
+                \"Environment=${prefix}\" `
+                \"AOAGCluster=${aoag}\" `
+                \"ResourceType=Application\" `
+                \"InterRegion0=${interregion_0_cidr}\" `
+                \"VpcId=${vpc_id}\" `
+                \"BastionSg=${bastion_sg}\" `
+                \"JenkinsHostsSg=${jenkins_host_sg}\" `
+                \"JenkinsContainerSg=${jenkins_container_sg}\" `
+                \"ScriptsSg=${scripts_sg}\" `
+                \"DbaToolingSg=${dba_tooling_sg}\" `
+                \"CIDRblockBackupServices=${commvault_cidr_block}\" `
+                \"CIDRblockESMServices=${esm_services_cidr_block}\" `
+                \"AnsibleSg=${ansible_sg}\" `
+                \"LinuxBastionSg=${linux_bastion_sg}\" `
+                \"ElbeanstalkSg=${beanstalk_sg}\" `
+                \"FargateSg=${fargate_sg}\" `
+                \"CRMSg=${crm_sg}\"""".stripIndent()
+        }
+    }
+
+    stage("deploy-sg-global-sql-platform-cfn-stack-name"){
+        dir("${cfn_repo}"){
+            powershell """\
+                aws cloudformation deploy `
+                --no-fail-on-empty-changeset `
+                --stack-name \"${sg_global_sql_platform_cfn_stack_name}\" `
+                --template-file \"cloudformation\\20-Security\\sg-global-sql-platform.yaml\" `
+                --capabilities CAPABILITY_IAM `
+                --region ${Region} `
+                --parameter-overrides `
+                \"Application=${service}\" `
+                \"ResourceName=global-ec2-mssql\" `
+                \"CostCenter=${cost_center}\" `
+                \"Environment=${prefix}\" `
+                \"ResourceType=Application\" `
+                \"VpcId=${vpc_id}\" `
+                \"BastionSg=${bastion_sg}\" `
+                \"JenkinsContainerSg=${jenkins_container_sg}\" `
+                \"AnsibleSg=${ansible_sg}\" `
+                \"CIDRblockBackupServices=${commvault_cidr_block}\" `
+                \"CIDRblockESMServices=${esm_services_cidr_block}\"""".stripIndent()
+        }
+    }    
+}

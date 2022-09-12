@@ -1,0 +1,51 @@
+#!/usr/bin/env groovy
+if (env.JENKINS_URL.contains('myunity-bo-prod-jenkins')) {
+    url_account_endpoint = "prod"
+}
+else if (env.JENKINS_URL.contains('myunity-bo-test-jenkins')){
+    url_account_endpoint = "test"
+}
+else{
+    error("Unknown Jenkins instance... Exiting")
+}
+
+def createmyUnityDNSRecords(role_arn, hosted_zone_id, myunity_url, endpoint, time_to_live, region) {    
+    out = bat (script: "@python ${env.workspace}\\python\\create_crossaccount_cname.py \"${role_arn}\" \"${hosted_zone_id}\" \"${myunity_url}\" \"${endpoint}\" \"${time_to_live}\" \"${region}\"",returnStdout: true).trim()
+    println out
+}    
+
+pipeline {
+agent { label 'msbuild' }
+options {
+    buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '1'))
+    }
+    stages {
+        stage("set-dns"){
+            steps {
+                script{     
+                    if (hostedzone.equals("netsmartdev")) {
+                        hosted_zone_id = 'Z3MD6WCBMBSHVW'
+                    } else if (hostedzone.equals("netsmartcloud")) {
+                        hosted_zone_id = 'Z2RZKAAEFIPAY3'
+                    } else {
+                        return 'Script Error'
+                    }
+
+                    role_arn = "arn:aws:iam::241208932964:role/route53_upsert_records"
+                    time_to_live ="300"
+
+                    endpoint = "myunity-${StackId}-front-${url_account_endpoint}.${AWSRegion}.elasticbeanstalk.com"    
+                    echo "Endpoint: ${endpoint}"
+                    
+                    vanity_url = "${vanity_domain}.${hostedzone}.com"
+                    echo "Vanity Url: ${vanity_url}"
+                    
+                    echo "hosted_zone_id: ${hosted_zone_id}"
+                    
+                    //creating records for environment
+                    createmyUnityDNSRecords("${role_arn}", "${hosted_zone_id}", "${vanity_url}", "${endpoint}", "${time_to_live}", "${AWSRegion}")
+                }
+            }
+        }
+    }    
+}

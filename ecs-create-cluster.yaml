@@ -1,0 +1,67 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Deploys ECS cluster service infrastructure
+  Last Update:
+    20220119
+
+Parameters:
+  Application:
+    Type: String
+    Description: The Application tag is used to designate the application of the associated AWS resource. In this capacity application does not refer to an installed software component, but rather the overall business application that the resource supports.
+    Default: myunity
+  ResourceName:
+    Type: String
+  CostCenter:
+    Type: String
+  Environment:
+    Type: String
+    Description: The environment tag (e.g. dev, qa, prod, etc.) is used to designate the Environment Stage of the associated AWS resource.
+  ResourceType:
+    Type: String
+    AllowedValues:
+      - Application
+      - "Shared Service"
+      - "Support System"
+    Default: Application
+  ClusterNameParameter: 
+    Description: "cluster name"
+    Type: String
+  StackIDParameter: 
+    Description: "Environment stack. i.e. t1, t2, s1, s2, p1, p2, ..."
+    Type: String
+
+Mappings:
+  CloudFormation:
+    Architecture:
+      Version: 1.0
+    MigrationAssistanceProgram:
+      ServerId: d-server-02bezuej0o1ftf
+
+Resources:
+  ServicesCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Join [ "-", [ !Ref ClusterNameParameter, !Ref StackIDParameter, !Ref "AWS::Region", "cluster" ] ]
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Join ["-", [!Ref Application, !Ref Environment, !Ref ResourceName]]
+        - Key: Application
+          Value: !Ref Application
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Type
+          Value: !Ref ResourceType
+        - Key: ArchitectureVersion
+          Value: !FindInMap [CloudFormation, Architecture, Version]
+        - Key: map-migrated
+          Value: !FindInMap [CloudFormation, MigrationAssistanceProgram, ServerId]
+
+Outputs:  
+  ClusterName:
+    Description: Cluster Name
+    Value: !Ref ServicesCluster

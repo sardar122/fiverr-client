@@ -1,0 +1,83 @@
+fullDestPathS3 = "BuildOutputs/${ParentBuildName}/${ParentBuildNumber}"
+deploymentPathS3 = "${ParentBuildName}"
+dbArtifactName = "dbupgrade_${ParentBuildNumber}.zip"
+awsRegion = "${AWSRegion}"
+awsUser = "${AWSProfile}"
+s3Bucket = "${AWSS3Bucket}"
+completeFileName = "CONTENT_COMPLETE_${ParentBuildNumber}.txt"
+
+
+def uploadContentCompleteFile() {
+    
+    //create file to signal that the content is all uploaded for this build.
+    println completeFileName
+    writeFile([file: completeFileName, text: "${ParentBuildName}-${ParentBuildNumber} content complete."])
+    
+    
+    withAWS(region: awsRegion, credentials: awsUser) {
+        echo "Uploading content with AWS creds";
+        s3Upload(pathStyleAccessEnabled: true,
+            payloadSigningEnabled: true,
+            includePathPattern: "${completeFileName}",
+            bucket: "${s3Bucket}/${ParentBuildName}")
+    }
+    
+}
+
+pipeline {
+    agent { label 'msbuild' }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '2'))
+    }
+    stages {
+        stage("clean-workspace") {
+            steps {
+                script {
+                    deleteDir();
+                }
+            }
+        }
+        stage('create-elb-artifact') {
+            steps {
+                build job: 'create-elb-artifact', parameters: [
+                    string(name: 'ParentBuildName', value: "${ParentBuildName}"),
+                    string(name: 'ParentBuildNumber', value: "${ParentBuildNumber}"),
+                    booleanParam(name: 'AWSUploadToS3', value: true)
+                ]
+            }
+        }
+        stage('create-crm-filewatcher-artifact') {
+            steps {
+                build job: 'CRM/create-crm-filewatcher-artifact', parameters: [
+                    string(name: 'ParentBuildName', value: "${ParentBuildName}"),
+                    string(name: 'ParentBuildNumber', value: "${ParentBuildNumber}"),
+                    booleanParam(name: 'AWSUploadToS3', value: true),
+                    string(name: 'AWSRegion', value: "${awsRegion}"),
+                    string(name: 'AWSS3Bucket', value: "${s3Bucket}")
+                ]
+            }
+        }
+        stage('create-dockers-images') {
+            steps {
+                build job: 'create-services-docker-images', parameters: [
+                    string(name: 'ParentBuildName', value: "${ParentBuildName}"),
+                    string(name: 'ParentBuildNumber', value: "${ParentBuildNumber}"),
+                    booleanParam(name: 'UploadToECR', value: true)
+                ]
+            }
+        }
+        stage('upload-dbupgrade-files'){
+            steps {
+                withAWS(region: awsRegion, credentials: awsUser) {
+                    echo "Copy content db scripts latest.";
+                    s3Copy(fromBucket: s3Bucket, fromPath: "${fullDestPathS3}/${dbArtifactName}", toBucket: s3Bucket, toPath: "${ParentBuildName}/${dbArtifactName}")
+                }
+            }
+        }
+    }
+    post {
+        success {
+            uploadContentCompleteFile();
+        }
+    }
+}

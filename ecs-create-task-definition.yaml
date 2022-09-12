@@ -1,0 +1,204 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+    This template deploys a stack & service specific myUnity BackOffice service task definition.
+    Last Update:
+      2022.05.20
+
+Parameters:
+    ServiceNameParameter: 
+        Description: "Service name. i.e. JobScheduler, Workflow, ..."
+        Type: String
+    StackIdParameter: 
+        Description: "Environment stack. i.e. t1, t2, s1, s2, p1, p2, ..."
+        Type: String
+    Application:
+        Type: String
+        Description: The Application tag is used to designate the application of the associated AWS resource. In this capacity application does not refer to an installed software component, but rather the overall business application that the resource supports.
+        Default: myunity
+    ResourceName:
+        Type: String
+    CostCenter:
+        Type: String
+    Environment:
+        Type: String
+        Description: The environment tag (e.g. dev, qa, prod, etc.) is used to designate the Environment Stage of the associated AWS resource.
+    ResourceType:
+        Type: String
+        AllowedValues:
+            - Application
+            - "Shared Service"
+            - "Support System"
+        Default: Application
+    TaskRoleNameParameter:
+        Description: "Task Role Name"
+        Type: String
+    ImageTagParameter: 
+        Description: "nonProd: latest or version specific, ie 2022.02[.XX[.XXX]]"
+        Type: String
+    LogGroupNameParameter:
+      Type: String
+    CpuParameter:
+      Type: Number
+      Default: 1024
+    MemoryParameter:
+      Type: Number
+      Default: 2048
+    #Include parameters for AppSettings required at startup, before the service has access to the AppParameter. They will be set as EnvVars.
+    AppParamNameParameter:
+        Type: String
+        Description: Name of the ParameterStore entry that contains AppSetting for this service at runtime.
+    CacheEndPointUrlParameter:
+        Type: String
+        Description: Redis url.
+    CacheEndPointPortParameter:
+        Type: String
+        Description: Redis port.
+        Default: 6379
+    CacheApplicationNameParameter:
+        Type: String
+        Description: Redis ClientName.
+        Default: myUnity
+    CacheTimeoutParameter:
+        Type: String
+        Description: Redis KeepAlive.
+        Default: 5000
+    CacheEndpointSslParameter:
+        Type: String
+        Description: True or False, use SSL for Redis connection. If True, AccessKey is required.
+        Default: False
+    CacheProviderAccessKeyParameter:
+        Type: String
+        Description: Redis password.
+        NoEcho: true
+    CacheConnectionTimeoutInMillisecondsParameter:
+        Type: String
+        Description: Redis ConnectTimeout.
+        Default: 0
+    CacheOperationTimeoutInMillisecondsParameter:
+        Type: String
+        Description: Redis SyncTimeout.
+        Default: 0
+    LoggingAppNameParameter:
+        Type: String
+        Description: Name used in log output for correlation.
+        Default: myUnity
+    LoggingDirectoryParameter:
+        Type: String
+        Description: Directory for logs.
+        Default: myUnity
+    LoggingMinimumSeverityLevelParameter:
+        Type: String
+        Description: Minimum level of logs to collect (Verbose, Debug, Information, Warning, Error, Fatal).
+        AllowedValues: 
+          - Information
+          - Warning
+          - Error
+          - Fatal 
+          - Debug
+          - Verbose
+        Default: "Information"
+
+
+
+Mappings:
+  ServiceMap:
+    Workflow: 
+      Underscored: workflow
+    Telephony:
+      Underscored: telephony
+    Guardiant:
+      Underscored: guardiant_collector
+    HL7:
+      Underscored: hl7
+    InteropOutbound:
+      Underscored: interop_outbound
+    InteropInbound:
+      Underscored: interop_inbound
+    RemoteCommAgent:
+      Underscored: remote_comm_agent
+    JobScheduler: 
+      Underscored: job_scheduler
+    OfflineMtf: 
+      Underscored: offline_mtf
+  CloudFormation:
+    Architecture:
+      Version: 1.0
+    MigrationAssistanceProgram:
+      ServerId: d-server-02bezuej0o1ftf
+
+Resources:
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Join [ "-", [ !Ref StackIdParameter, !Ref ServiceNameParameter, "task-definition"] ]
+      RequiresCompatibilities:
+        - "FARGATE"
+      NetworkMode: awsvpc
+      Cpu: !Ref CpuParameter
+      Memory: !Ref MemoryParameter
+      ExecutionRoleArn: !Join [ "", [ "arn:aws:iam::", Ref: "AWS::AccountId", ":role/", !Ref TaskRoleNameParameter]]
+      TaskRoleArn: !Join [ "", [ "arn:aws:iam::", Ref: "AWS::AccountId", ":role/", !Ref TaskRoleNameParameter]]
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+      Tags:
+        - Key: Name
+          Value: !Join ["-", [!Ref Application, !Ref Environment, !Ref ResourceName]]
+        - Key: Application
+          Value: !Ref Application
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Type
+          Value: !Ref ResourceType
+        - Key: "ImageVersionTag"
+          Value: !Ref ImageTagParameter
+        - Key: ArchitectureVersion
+          Value: !FindInMap [CloudFormation, Architecture, Version]
+        - Key: map-migrated
+          Value: !FindInMap [CloudFormation, MigrationAssistanceProgram, ServerId]
+      ContainerDefinitions: 
+        - Name: !Ref ServiceNameParameter
+          Image: !Join ["",[!Ref AWS::AccountId, ".dkr.ecr.", !Ref AWS::Region, ".amazonaws.com/myunity-bo-svc-", !FindInMap [ServiceMap, !Ref ServiceNameParameter, Underscored], ":", !Ref ImageTagParameter]]
+          Essential: true
+          Environment:
+            - Name : MUE_UseAWS
+              Value : True
+            - Name : MUE_AWSStackConfigurationParameterName
+              Value : !Ref AppParamNameParameter
+            - Name : MUE_CacheEndPointUrl
+              Value : !Ref CacheEndPointUrlParameter
+            - Name : MUE_CacheEndPointPort
+              Value : !Ref CacheEndPointPortParameter
+            - Name : MUE_CacheApplicationName
+              Value : !Ref CacheApplicationNameParameter
+            - Name : MUE_CacheTimeout
+              Value : !Ref CacheTimeoutParameter
+            - Name : MUE_CacheEndpointSsl
+              Value : !Ref CacheEndpointSslParameter
+            - Name : MUE_CacheProviderAccessKey
+              Value : !Ref CacheProviderAccessKeyParameter
+            - Name : MUE_CacheConnectionTimeoutInMilliseconds
+              Value : !Ref CacheConnectionTimeoutInMillisecondsParameter
+            - Name : MUE_CacheOperationTimeoutInMilliseconds
+              Value : !Ref CacheOperationTimeoutInMillisecondsParameter
+            - Name : MUE_Logging_AppName
+              Value : !Ref LoggingAppNameParameter
+            - Name : MUE_Logging_Directory
+              Value : !Ref LoggingDirectoryParameter
+            - Name : MUE_Logging_MinimumSeverityLevel
+              Value : !Ref LoggingMinimumSeverityLevelParameter
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroupNameParameter
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+Outputs:  
+  TaskDefinitionFamily:
+    Description: Task Definition Family
+    Value: !Join [ "-", [ !Ref StackIdParameter, !Ref ServiceNameParameter, "task-definition"] ]
+  DockerImage:
+    Description: Task Definition Docker image
+    Value: !Join ["",[!Ref AWS::AccountId, ".dkr.ecr.", !Ref AWS::Region, ".amazonaws.com/myunity-bo-svc-", !FindInMap [ServiceMap, !Ref ServiceNameParameter, Underscored], ":", !Ref ImageTagParameter]]

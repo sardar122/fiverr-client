@@ -1,0 +1,45 @@
+String buildNumberStripped = "${OriginalCallingJobName}".replaceAll(~/\s/,"").replaceAll(~/[()]/, "");
+awsRegion = "${AWSRegion}"
+awsProfile = "${AWSProfile}"
+
+pipeline {
+    agent any
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '2'))
+        copyArtifactPermission("${ParentBuildName}");
+    }
+    stages {
+        stage("clean-workspace") {
+            steps {
+                script {
+                    deleteDir();
+                }
+            }
+        }
+        stage("get-parent-build-files") {
+            // get the files from the parent build.This would probably be better coming from an S3. What should trigger it?
+            steps {
+                script {
+                    step ([$class: 'CopyArtifact',
+                        projectName: "${ParentBuildName}",
+                        filter: "${CopyArtifactFilter}",
+                        selector: specific("${ParentBuildNumber}"),
+                        flatten: "${Flatten}"]);
+                }
+            }
+        }
+        // Compile & upload EBS Package
+        stage('upload-ebs-to-s3') {
+            steps {
+                echo "Uploading to aws S3";
+                withAWS(region:awsRegion,credentials:awsProfile) {
+                    echo "Uploading content with AWS creds";
+                    s3Upload(pathStyleAccessEnabled: true, 
+                        payloadSigningEnabled: true, 
+                        includePathPattern:"${S3includePathPattern}",
+                        bucket:"${AWSS3Bucket}/${OriginalCallingJobName}")
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,190 @@
+def pathInS3 = "BuildOutputs/${ParentBuildName}/${ParentBuildNumber}"
+dbArtifactName = "dbupgrade_${ParentBuildNumber}.zip"
+awsRegion = "${AWSRegion}"
+awsProfile = "${AWSProfile}"
+testFilesZip = "testdependencies.zip"
+
+def checkoutService(gitRepo, gitBranch) {
+    //bitbucket account id from jenkins
+    def git_credentials_id = "bitbucket_bbcloudapi"
+    def gitBranchParameter = "${gitBranch}".toString()
+    checkout([$class: 'GitSCM',
+          branches: [[name: "${gitBranchParameter}"]],
+          doGenerateSubmoduleConfigurations: false,
+          submoduleCfg: [],
+          userRemoteConfigs: [[url: "https://bitbucket.org/ntsttech/${gitRepo}.git", credentialsId: "${git_credentials_id}"]],
+         ])
+}
+
+
+pipeline {
+    agent { label 'msbuild' }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '5'))
+    }
+    stages {
+        stage("clean-workspace") {
+            steps {
+                script {
+                    deleteDir();
+                }
+            }
+        }
+        stage('checkout-source-code') {
+            // checkout from git
+            steps {
+                checkoutService("${git_repo}","${git_branch}")
+            }
+        }
+        stage("download-and-unzip-build-files") {
+            steps {
+                withAWS(region: awsRegion, credentials: awsProfile) {
+                    echo "Getting content from S3 with AWS creds";
+                    s3Download(file: testFilesZip, bucket: "${AWSS3Bucket}", path: "${pathInS3}/${testFilesZip}", force: true)
+                    unzip dir: 'Files', glob: '', zipFile: testFilesZip
+                    
+                    s3Download(file: "${dbArtifactName}", bucket: "${AWSS3Bucket}", path: "${pathInS3}/${dbArtifactName}", force: true)
+                    unzip dir: 'Scripts', glob: '', zipFile: "${dbArtifactName}"
+                }
+            }
+        }
+        stage("update-databases") {
+            steps {
+                script {
+                    
+                    println 'Updating databases...'
+                    def out = powershell(returnStdout: true, script: """
+                    
+                    \$sourcesPath = "${env.WORKSPACE}\\Files"
+                    \$appConfigPath = "\$sourcesPath\\.CommonLinkedFiles\\app.config";
+                    \$scriptsPath = "${env.WORKSPACE}\\Scripts"
+                    \$QADB = 'QADB'
+                    
+                    class ConfigValues {
+                        [string]\$DBServer
+                        [string]\$EnterpriseSys
+                        [string]\$WCSecureName
+                    }
+
+                    Function Get-ConnectionInfo() {
+                    
+                        #get values from .CommonLinkedFiles\\app.
+                        [ConfigValues]\$configVals = Set-ValuesFromAppConfig -cfgPath \$appConfigPath 
+                    
+                        \$SqlConnection = New-Object System.Data.SqlClient.SqlConnection
+                        
+                        \$SqlConnection.ConnectionString = "Server=\$(\$configVals.DBServer);Database=\$(\$configVals.WCSecureName);Integrated Security=False"
+                        
+                        \$SecurePassword = ConvertTo-SecureString -AsPlainText -Force \$QADB
+                        \$SecurePassword.MakeReadOnly()
+                        \$creds = New-Object System.Data.SqlClient.SqlCredential(\$QADB, \$SecurePassword)
+                        \$SqlConnection.Credential = \$creds;
+                     
+                        \$SqlCmd = New-Object System.Data.SqlClient.SqlCommand
+                    
+                        \$SqlCmd.CommandText = \$("SELECT TOP 1 dbo.ConnectionStringPart(1,MetaConnect) MetaConnectDataSource,dbo.ConnectionStringPart(2,MetaConnect) MetaConnectCatalog,dbo.ConnectionStringPart(1,MainConnect) MainConnectDataSource,dbo.ConnectionStringPart(2,MainConnect) MainConnectCatalog,dbo.ConnectionStringPart(1,WCMetaConnect) WCMetaConnectDataSource,dbo.ConnectionStringPart(2,WCMetaConnect) WCMetaConnectCatalog,dbo.ConnectionStringPart(1,ClientSecureConnect) ClientSecureConnectDataSource,dbo.ConnectionStringPart(2,ClientSecureConnect) ClientSecureConnectCatalog FROM dbo.Enterprises WHERE EnterpriseSys = \$(\$configVals.EnterpriseSys)")
+                     
+                        \$SqlCmd.Connection = \$SqlConnection    
+                     
+                        \$SqlAdapter = New-Object System.Data.SqlClient.SqlDataAdapter
+                     
+                        \$SqlAdapter.SelectCommand = \$SqlCmd
+                     
+                        \$DataSet = New-Object System.Data.DataSet
+                     
+                        \$SqlAdapter.Fill(\$DataSet)
+                     
+                        \$SqlConnection.Close()
+                     
+                        \$data = \$dataset.Tables[0]
+                     
+                        return \$data
+                    }
+                    
+                    Function Set-ValuesFromAppConfig() {
+                        param(
+                            \$cfgPath
+                        )
+                    
+                        \$cfgVals = [ConfigValues]::new()
+                    
+                        \$xml = [xml] (Get-Content \$cfgPath)
+                        \$cfgVals.DBServer = \$xml.SelectSingleNode('//add[@key="DB_Name"]').Value
+                        \$cfgVals.EnterpriseSys = \$xml.SelectSingleNode('//add[@key="EnterpriseSys"]').Value
+                        \$cfgVals.WCSecureName = \$xml.SelectSingleNode('//add[@key="DB_WCSecureName"]').Value
+                    
+                        return \$cfgVals;
+                    }
+                    
+                    Function UpdateDB {
+                        param(
+                            \$dbSvr,
+                            \$dbName,
+                            \$dbScriptPath
+                        )
+                    
+                        sqlcmd -S \$dbSvr -d \$dbName -i "\$dbScriptPath" -U \$QADB -P \$QADB
+                    }
+                    
+                    #get from WCSecure
+                    \$connInfo = Get-ConnectionInfo
+                    
+                    #Get connection info from the return 
+                    \$metaConnect = \$connInfo.ItemArray[0]
+                    \$metaConnectDataSource = \$connInfo.ItemArray[1]
+                    
+                    \$mainConnect = \$connInfo.ItemArray[2]
+                    \$mainConnectDataSource = \$connInfo.ItemArray[3]
+                    
+                    \$wcMetaConnect = \$connInfo.ItemArray[4]
+                    \$wcMetaConnectDataSource = \$connInfo.ItemArray[5]
+                    
+                    \$clientSecureConnect = \$connInfo.ItemArray[6]
+                    \$clientSecureConnectDataSource = \$connInfo.ItemArray[7]
+                    
+                    updatedb -dbSvr \$metaConnect -dbName \$metaConnectDataSource -dbScriptPath "\$scriptsPath\\Consolidated HMXMeta Update Script_Deploy.sql"
+                    updatedb -dbSvr \$mainConnect -dbName \$mainConnectDataSource -dbScriptPath "\$scriptsPath\\Consolidated OLTP Update Script_Deploy.sql"
+                    updatedb -dbSvr \$wcMetaConnect -dbName \$wcMetaConnectDataSource -dbScriptPath "\$scriptsPath\\Consolidated WCMeta Update Script_Deploy.sql"
+                    updatedb -dbSvr \$clientSecureConnect -dbName \$clientSecureConnectDataSource -dbScriptPath "\$scriptsPath\\Consolidated Client Secure Update Script_Deploy.sql"
+                    
+                    
+                    """);
+                    
+                    println out
+                }
+            }
+        }
+        stage("execute-tests") {
+            steps {
+                script {
+                    
+                    
+                    def includeFilter = '*test*.dll';
+                    def excludeFilter = '*Test.Unit.JavaScript.dll';
+                    def customAdapterPath = "${env.WORKSPACE}\\Files\\AutoBuild Solution\\";
+                    def settingsFile = "${env.WORKSPACE}\\Files\\test.runsettings";
+                    def searchPath = "${env.WORKSPACE}\\Files";
+                    def resultsPath = "${env:WORKSPACE}\\TestResults";
+
+                    def result = powershell(returnStatus: true, script: """Powershell\\RunVSTest.ps1 -vsTestLocation "${VSTEST_PATH}" -searchFolder "${searchPath}" -customAdaptersPath "${customAdapterPath}" -settingsFile "${settingsFile}" -includeFilter ${includeFilter} -excludeFilter ${excludeFilter} -resultsPath "${resultsPath}" """);
+                    println "result ${result}"
+
+                    if (result != 0) {
+                        powershell(returnStdout: true, script: """Powershell\\GetVSTestFailures.ps1 -trxPath "${resultsPath}" """);
+                    }
+                }
+            }
+        }
+    }
+    post {
+     //   failure {
+           // emailext body: 'Check console output at $BUILD_URL to view the results. \n\n ${CHANGES} \n\n -------------------------------------------------- \n${BUILD_LOG, maxLines=100, escapeHtml=false}', 
+            //        to: "${EMAIL_TO}", 
+            //        subject: 'Build failed in Jenkins: $PROJECT_NAME - #$BUILD_NUMBER'
+       // }
+        always {
+                archiveArtifacts artifacts: "TestResults/*.trx",
+                onlyIfSuccessful: false;
+        }
+    }
+}

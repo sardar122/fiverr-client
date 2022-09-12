@@ -1,0 +1,107 @@
+import groovy.json.JsonSlurper
+
+def checkoutService(gitRepo, gitBranch) {
+    //bitbucket account id from jenkins
+    def git_credentials_id = "bitbucket_bbcloudapi"
+    def gitBranchParameter = "${gitBranch}".toString()
+    checkout([$class: 'GitSCM',
+          branches: [[name: "${gitBranchParameter}"]],
+          doGenerateSubmoduleConfigurations: false,
+          submoduleCfg: [],
+          userRemoteConfigs: [[url: "https://bitbucket.org/ntsttech/${gitRepo}.git", credentialsId: "${git_credentials_id}"]],
+         ])
+}
+
+def getArtifactsFromS3(s3Bucket, s3Folder, artifactToGet, targetVersion, localFolder, scriptName) {
+    //This will download the zip(s) from the S3 location.
+    powershell(returnStdout: true, script: """
+        Using module \"${ENV:WORKSPACE}\\Powershell\\mubo_core.psm1\";
+        
+        function Invoke-GetArtifacts {
+            & (Get-ScriptDirectory -PostPath \"${ENV:WORKSPACE}\\Powershell\\""" + scriptName + """\") `
+                -S3Folder \"""" + s3Folder + """\" -ArtifactToGet \"""" + artifactToGet + """\" -TargetVersion \"""" + targetVersion + """\" -S3Bucket \"""" + s3Bucket + """\" -LocalFolder \"""" + localFolder + """\";
+        }
+        
+        function Main {
+            Invoke-GetArtifacts;
+        }
+        
+        Main
+     """)
+}
+
+def cleanUpArtifacts(localFolder, scriptName) {
+    //This will go delete the files from the Jenkins Node
+    powershell(returnStdout: true, script: """
+        Using module \"${ENV:WORKSPACE}\\Powershell\\mubo_core.psm1\";
+        
+        function Invoke-CleanUpArtifacts {
+            & (Get-ScriptDirectory -PostPath \"${ENV:WORKSPACE}\\Powershell\\""" + scriptName + """\") `
+                -LocalFolder \"""" + localFolder + """\";
+        }
+        
+        function Main {
+            Invoke-CleanUpArtifacts;
+        }
+        
+        Main
+     """)
+}
+
+pipeline {
+    agent none
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '1'))
+    }
+    
+    stages {
+    
+        stage('clean-workspace') {
+            agent {label 'msbuild'}
+            steps {
+                // Clean before build
+                cleanWs()
+            }
+        }
+        stage('checkout-source-code') {
+            agent {label 'msbuild'}
+            // checkout from git
+            steps {
+                checkoutService("${git_repo}","${git_branch}")
+            }
+        }
+        stage('get-artifacts') {
+            agent {label 'msbuild'}
+            steps {
+                getArtifactsFromS3("${S3_Bucket}", "CRM", "crm","${Target_Version}", "${ENV:WORKSPACE}\\ntst-artifactory-promote-crm", "get-mubo-artifacts-from-s3.ps1")
+                
+            }
+        }
+        stage ('Upload Artifacts to Artifactory'){
+            agent {label 'msbuild'}
+            environment {
+                targetVersion = "${Target_Version}"
+            }
+            steps {
+                rtUpload (
+                    serverId: "artifactory-cloud",
+                    spec:
+                        """{
+                        "files": [
+                            {
+                            "pattern": "ntst-artifactory-promote-crm\\crm-${targetVersion}.zip",
+                            "target": "myunity-backoffice-local/web/crm/"
+                            }
+                        ]
+                        }"""
+                )
+            }
+        }
+        stage('cleanup-artifacts') {
+            agent {label 'msbuild'}
+            steps {
+                cleanUpArtifacts("${ENV:WORKSPACE}\\ntst-artifactory-promote-crm", "cleanup-promoted-artifacts.ps1")
+            }
+        }
+    }
+}

@@ -1,0 +1,102 @@
+def installCliandInstallerModule(ec2_instance_id) {
+    return runAwsSsmPowershellCMD('''function ModuleInstalled($module) { 
+        if (Get-Module -ListAvailable -Name $module) { 
+            Write-Host "$module installed." } 
+        else { 
+            throw "Unable to install $module";
+        }}; 
+        
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; 
+        
+        try {
+            If ((Get-PackageProvider -Name Nuget -ListAvailable -ErrorAction Stop ).Version -le 2.8.5.208 ){
+                Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.208 -Force } 
+            else { 
+                write-host "Nuget provider 2.8.5.208 or greater already installed." }
+            } 
+        catch { 
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.208 -Force 
+        }; 
+        
+        Install-Module -Name AWS.Tools.Installer -Force; 
+        ModuleInstalled -module AWS.Tools.Installer; 
+        
+        "* Installing AWS CLI..."; 
+        $dlurl = "https://awscli.amazonaws.com/AWSCLIV2.msi"; 
+        $installerPath = Join-Path "c:\\\\temp" (Split-Path $dlurl -Leaf); 
+        Invoke-WebRequest $dlurl -OutFile (new-item -path $installerPath -Force); 
+        Start-Process -FilePath msiexec -Args "/i $installerPath /passive" -Verb RunAs -Wait; 
+        Remove-Item $installerPath; 
+        $env:Path += ";C:\\\\Program Files\\\\Amazon\\\\AWSCLIV2"; 
+        
+        if ((Get-Command aws -ErrorAction SilentlyContinue) -eq $null) { 
+            throw "AWS CLI is not installed. Please install AWS CLI.";} 
+        else { 
+            "AWS CLI installed."
+        ;}'''
+        ,ec2_instance_id)
+}
+def installS3Module(ec2_instance_id) {
+    return runAwsSsmPowershellCMD('''function ModuleInstalled($module) {
+        if (Get-Module -ListAvailable -Name $module) {
+            Write-Host "Module $module installed.";
+        } 
+        else {
+            throw "Unable to install module $module.";
+        }
+    }
+
+    Install-AWSToolsModule AWS.Tools.S3 -SkipPublisherCheck -Force -CleanUp -AllowClobber;
+    ModuleInstalled -module AWS.Tools.S3;
+    '''
+    ,ec2_instance_id)
+}
+
+def runInstalls(ec2_instance_id) { 
+    try {
+        firstCmdSuccess = installCliandInstallerModule(ec2_instance_id)
+        if(firstCmdSuccess){
+            installS3Module(ec2_instance_id) //need to install the installer and AWS.Tools.S3, etc. in separate commands. 
+        } else {
+            throw new Exception("An error occurred! Please review the logs!")
+        }
+    }        
+     catch (Exception e) {
+        throw e;
+    }
+} 
+def runAwsSsmPowershellCMD (commandText, ec2_instance_id) {
+    def fullScript = '''(Send-SSMCommand -DocumentName "AWS-RunPowerShellScript" -InstanceId "''' + ec2_instance_id + '''" -Parameter @{'commands' = ' ''' + commandText + ''' '}).commandid'''.stripIndent();
+    println fullScript
+    commandid = powershell (script: fullScript,returnStdout: true).trim()
+    
+    commandstatus = powershell (script: "(Get-SSMCommandInvocation -CommandId $commandid).Status.Value",returnStdout: true).trim()
+    loopcount = 0
+        echo "Command has been sent to perform the requested installs on ${ec2_instance_id}. The CommandId is \"${commandid}\""
+        echo "Current status is \"${commandstatus}\""
+        while("${commandstatus}"=="Pending" || "${commandstatus}"=="InProgress"){
+            sleep(10)
+            commandstatus = powershell (script: "(Get-SSMCommandInvocation -CommandId '$commandid').Status.Value",returnStdout: true).trim()
+            echo "Current status of the command is \"${commandstatus}\". Current Loopcount is \"${loopcount}\" ";
+            loopcount++;
+    }        
+    if("${commandstatus}"!="Success"){
+        throw new Exception("The command failed! Review the output in AWS Systems Manager > Run Command > Command History.")
+    } else {
+        return true;
+    }
+}
+
+pipeline {
+agent { label 'msbuild' }
+options {
+    buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '1'))
+    }
+       stages{ 
+            stage("run-installs"){
+               steps{
+                runInstalls("${ec2_instance_id}");
+           }
+       }
+   }
+}

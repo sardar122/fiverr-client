@@ -1,0 +1,149 @@
+def parameters
+def bucketName
+def buildName
+boolean deployPerformed = false;
+def lastAppliedVersion
+def latestAvailableBuildNumber
+awsUser = 'myUnityAutomation'
+contentCompleteFilePattern = "CONTENT_COMPLETE_*.txt"
+stackParamVarName = "/myUnity/Config/Stack_${StackId}/1.0/json"
+lastAppliedVarName = "/myUnity/Config/Stack_${StackId}/LastAppliedVersion"
+ebsSourceFilePreFix = "ebs-web-app_"
+zipExt = ".zip"
+
+def getParameters() {
+    //get the stack parameters from AWS    
+    println "Getting stack parameters from the AWS Parameter Store for stack ${StackId}."
+    def result = powershell(returnStdout: true, script: "aws ssm get-parameter --name \"${stackParamVarName}\" --with-decryption --query \"Parameter.Value\" --output text")    
+    parameters = readJSON text: result
+
+    //breakout the values to be used.
+    def bv = parameters.aws_web_app_bucket
+    bucketName = bv.substring(0,bv.indexOf('/'))
+    buildName = bv.substring(bv.indexOf('/')+1)
+    
+    println result
+}
+
+def getLastAppliedVersion() {
+    def result = powershell(returnStdout: true, script: "aws ssm get-parameter --name \"${lastAppliedVarName}\" --query \"Parameter.Value\"")
+    lastAppliedVersion = result.trim().replace("\"", "")
+    println "Last build applied to stack ${StackId} - ${buildName} #${lastAppliedVersion}"
+}
+
+def upgradeDB() {
+    build job: 'deploy-mubo-database-update', parameters: [
+        string(name: 'npc_ids', value: "${target_npc_ids}"),
+        string(name: 'target_environments', value: "${target_environments}"),
+        string(name: 'target_version', value: "${latestAvailableBuildNumber}"),
+        string(name: 'target_s3_path', value: "${buildName}"),
+        string(name: 'target_stack', value: "${StackId}")
+    ]
+}
+
+def upgradeWeb() {
+    build job: 'deploy-mubo-web-upgrade', parameters: [
+        string(name: 'StackId', value: "${StackId}"),
+        string(name: 'git_repo', value: "${git_repo}"),
+        string(name: 'git_branch', value: "${git_branch}"),
+        string(name: 'TargetVersion', value: "${latestAvailableBuildNumber}")
+    ]
+}
+
+def upgradeCRMFileWatcher() {
+    build job: 'CRM/deploy-mubo-crm-filewatcher-update', parameters: [
+        string(name: 'StackId', value: "${StackId}"),
+        string(name: 'TargetVersion', value: "${latestAvailableBuildNumber}"),
+        string(name: 'target_environments', value: "${target_environments}")
+    ]
+}
+
+def upgradeServices() {
+    String tag = "${buildName}-${latestAvailableBuildNumber}".replaceAll(~/\s/, "").replaceAll(~/[()]/, ""); //remove spaces etc. to match expected docker tag in ECR.
+    build job: 'deploy-mubo-services-upgrade', parameters: [
+        string(name: 'StackId', value: "${StackId}"),
+        string(name: 'git_repo', value: "${git_repo}"),
+        string(name: 'git_branch', value: "${git_branch}"),
+        string(name: 'TargetVersion', value: "${tag}")
+    ]
+}
+
+def swapStacks() {
+    build job: 'elastic-beanstalk-environment-swap', parameters: [
+        string(name: 'StackId', value: "${StackId}")
+    ]
+}
+
+def updateLastAppliedVariable() {
+    if(deployPerformed) {
+        lastAppliedVersion = latestAvailableBuildNumber;
+        println "Setting ${lastAppliedVarName} to ${lastAppliedVersion}."
+        powershell(returnStdout: true, script: """Write-SSMParameter -Name \"${lastAppliedVarName}\" -Value \"${lastAppliedVersion}\" -Type "String" -Overwrite \$true""");
+    }
+}
+
+def getlatestAvailableBuildNumber() {
+    
+    def files 
+    withAWS(region: parameters.aws_region, credentials: awsUser) {
+        files = s3FindFiles(bucket:"${bucketName}", path:"${buildName}/", glob: contentCompleteFilePattern, onlyFiles: true)
+    }
+
+    def maxBuildNumber = 0
+    files.each { item ->
+        def fn = item.name
+        
+        int buildNumber = (fn.substring(fn.lastIndexOf('_') + 1, fn.indexOf('.'))).toInteger()
+        if ( buildNumber > maxBuildNumber ) {
+            maxBuildNumber = buildNumber
+        }
+    }
+    latestAvailableBuildNumber = maxBuildNumber
+    
+    println "Latest completed build found: ${buildName} #${latestAvailableBuildNumber}"
+}
+
+def upgradeStack(){
+    if(force_deploy.toBoolean() == true || latestAvailableBuildNumber.toString() != lastAppliedVersion.trim().toString()) {
+        deployPerformed = true;
+        upgradeWeb()
+        parallel (
+            services: { upgradeServices() },
+            db: { upgradeDB() },
+            crmfilewatcher: { upgradeCRMFileWatcher() },
+            failFast: false)
+        swapStacks()        
+    } else {
+        println "No new content. Skipping deploy."
+        deployPerformed = false;
+    }
+    
+}
+
+pipeline {
+    agent { label 'msbuild' }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '2'))
+    }
+        stages {
+            stage('get-paramstore-parameters') {
+                steps {
+                    getParameters()
+                    getLastAppliedVersion()
+                    getlatestAvailableBuildNumber()
+                }
+            }
+            stage('deploy-stack') {
+                steps {
+                    upgradeStack()
+                }
+            }
+        }
+        post {
+            success {
+                //update param store with latest version
+                updateLastAppliedVariable();
+            }
+        }
+}
+

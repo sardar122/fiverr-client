@@ -1,0 +1,62 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "AWS Elastic Beanstalk application"
+Parameters:
+  Application:
+    Type: String
+    Description: The Application tag is used to designate the application of the associated AWS resource. In this capacity application does not refer to an installed software component, but rather the overall business application that the resource supports.
+    Default: myunity
+  ResourceName:
+    Type: String
+  CostCenter:
+    Type: String
+  Environment:
+    Type: String
+    Description: The environment tag (e.g. dev, qa, prod, etc.) is used to designate the Environment Stage of the associated AWS resource.
+  ResourceType:
+    Type: String
+    AllowedValues:
+      - Application
+      - "Shared Service"
+      - "Support System"
+    Default: Application
+  ApplicationPrefixParameter: 
+    Type: String
+    MinLength: 1
+    Default: mubo-web
+    Description: "The prefix that will be used to ensure consistent naming convention of resources associated with this Elastic Beanstalk application (e.g mubo-web-app)."
+  StackIDParameter: 
+    Description: "Environment stack. i.e. t1, t2, s1, s2, p1, p2, ..."
+    Type: String
+    AllowedPattern: ^[tsp][1-9][0-9]*$
+  SolutionEnvironmentNameParameter: 
+    Type: String
+    MinLength: 1
+    Default: test
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - uat
+      - train
+      - prod
+  DescriptionParameter: 
+    Type: String
+
+Mappings:
+  CloudFormation:
+    Architecture:
+      Version: 1.0
+    MigrationAssistanceProgram:
+      ServerId: d-server-02bezuej0o1ftf
+
+Resources:
+  SolutionServiceHistoryApplication:
+    Type: AWS::ElasticBeanstalk::Application
+    Properties:
+      ApplicationName: !Join [ "-", [ !Ref ApplicationPrefixParameter, !Ref StackIDParameter, 'app', !Ref "AWS::Region", !Ref SolutionEnvironmentNameParameter ] ]
+      Description: !Ref DescriptionParameter
+
+Outputs:
+  Application:
+    Description: A reference to the application
+    Value: !Join [ "-", [ !Ref ApplicationPrefixParameter, !Ref StackIDParameter, 'app', !Ref "AWS::Region", !Ref SolutionEnvironmentNameParameter ] ]

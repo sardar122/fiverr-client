@@ -1,0 +1,109 @@
+import org.apache.commons.io.FileUtils;
+def pathInS3 = "BuildOutputs/${ParentBuildName}/${ParentBuildNumber}"
+def artifactTag = "${ParentBuildNumber}";
+def awsRegion = "${AWSRegion}"
+def sourceFileName = "output.zip"
+versionParamName = "myunity-package-versions"
+def versionJsonFileName = "version_info.json"
+def verParamsForParentBuildName
+
+def getVersionParamsForBuild() {
+    def retVal
+    def entVar
+    def result = powershell(returnStdout: true, script: """
+        aws ssm get-parameter --name \"${versionParamName}\" --with-decryption --query \"Parameter.Value\" --output text
+    """)    
+    entVar = readJSON text: result
+    retVal = entVar."${ParentBuildName}"
+    println retVal
+    return retVal;
+}
+
+pipeline {
+    agent { label 'msbuild' }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '5'))
+    }
+    stages {
+        stage('clean-destination-folder') {
+            steps {
+                dir('a') {
+                    deleteDir()
+                }
+            }
+        }
+        stage("get-paramstore-variables") {
+            steps {
+                script {
+                  verParamsForParentBuildName = getVersionParamsForBuild();
+                }
+            }
+        }
+        stage("download-and-unzip-build-files") {
+            steps {
+                withAWS(region: awsRegion) {
+                    echo "Getting content from S3 with AWS creds";
+                    s3Download(file: sourceFileName, bucket: "${AWSS3Bucket}", path: "${pathInS3}/${sourceFileName}", force: true)
+                    unzip dir: 'a', glob: '', zipFile: sourceFileName
+                }
+            }
+        }
+        stage('build-crm-artifact') {
+            steps {
+                script {
+                    powershell(returnStdout: true, script: """
+                        \$workspacePath = "${env.WORKSPACE}\\a"
+                        \$destinationPath = "${env.WORKSPACE}\\a\\Results"
+
+                        \$sourcePathRoot = "\$workspacePath\\Components\\CRMFileWatcher\\CRMFileWatcher.exe";
+
+                        \$zipName = 'crm-filewatcher_${artifactTag}.zip';
+                        \$zipTempPath = "\$workspacePath\\\$zipName";
+                        \$zipPath = "\$destinationPath\\\$zipName";
+
+                        if (Test-Path \$zipTempPath) {
+                            Write-Host "Cleaning \$zipTempPath"
+                            Remove-Item \$zipTempPath -Force
+                        }
+
+                        if (Test-Path \$zipPath) {
+                            Write-Host "Cleaning \$zipPath"
+                            Remove-Item \$zipPath -Force
+                        }
+                                                                
+                        #compress the folder
+                        Write-Host "Creating \$zipTempPath";
+                        Compress-Archive -Path "\$sourcePathRoot" -DestinationPath \$zipTempPath
+                                    
+                        #copy to the artifacts folder
+                        Write-Host 'Copy zip to artifact path';
+                        If(!(test-path \$destinationPath)) { New-Item -ItemType Directory -Force -Path \$destinationPath }
+
+                        Copy-Item -Path \$zipTempPath -Destination \$zipPath -Recurse
+                """);
+                }   
+            }
+        }
+        stage('archive-build-artifacts') {
+            steps {
+                archiveArtifacts artifacts: 'a/Results/*.zip',
+                    onlyIfSuccessful: true;
+            }
+        }
+        stage('upload-to-aws-s3') {
+            steps {
+                script {
+                    if (AWSUploadToS3.toBoolean()) {
+                        build job: 'mubo-build-artifact-upload-aws-s3', parameters: [
+                            string(name: 'ParentBuildName', value: "${JOB_NAME}"),
+                            string(name: 'ParentBuildNumber', value: "${BUILD_NUMBER}"),
+                            string(name: 'OriginalCallingJobName', value: "${ParentBuildName}"),
+                            booleanParam(name: 'Flatten', value: true),
+                            string(name: 'S3includePathPattern', value: "**/*.zip")
+                        ]
+                    }
+                }
+            }
+        }
+    }
+}

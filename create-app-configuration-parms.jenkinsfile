@@ -1,0 +1,322 @@
+import groovy.json.JsonSlurper
+
+if (env.JENKINS_URL.contains('myunity-bo-prod-jenkins')) {
+    cost_center = "2016 Hosting - Post Acute"
+} else if (env.JENKINS_URL.contains('myunity-bo-test-jenkins')) {
+    cost_center = "5027 RD - myUnity Homecare and Hospice"
+} else {
+    error("Unknown Jenkins instance... Exiting")
+}
+
+def checkoutService(gitRepo, gitBranch) {
+    //bitbucket account id from jenkins
+    def git_credentials_id = "bitbucket_bbcloudapi"
+    def gitBranchParameter = "${gitBranch}".toString()
+    checkout([$class: 'GitSCM',
+          branches: [[name: "${gitBranchParameter}"]],
+          doGenerateSubmoduleConfigurations: false,
+          submoduleCfg: [],
+          userRemoteConfigs: [[url: "https://bitbucket.org/ntsttech/${gitRepo}.git", credentialsId: "${git_credentials_id}"]],
+         ])
+}
+
+def createResources() {
+    powershell(returnStdout: true, script: """
+Using module \"${ENV:WORKSPACE}\\Powershell\\mubo_core.psm1\";
+
+\$commonAppSettings = @"
+{
+    "stack_id": "${StackID}",
+    "DB_Name": "${DB_Name}",
+    "DB_WCSecureName": "${DB_WCSecureName}",
+    "DB_UserID": "${DB_UserID}",
+    "DB_Password": "${DB_Password}",
+    "DB_DefaultDomain": "${DB_DefaultDomain}",
+    "CacheEndPointUrl": "${CacheEndPointUrl}",
+    "CacheEndPointPort": "6379",
+    "CacheApplicationName": "myUnity",
+    "CacheTimeout": "${CacheTimeout}",
+    "CacheEndpointSsl": "true",
+    "CacheProviderAccessKeySecretId": "${CacheProviderAccessKeySecretId}",
+    "CacheConnectionTimeoutInMilliseconds": "5000",
+    "CacheOperationTimeoutInMilliseconds": "1000",
+    "UseRoutingForWorkFileRepLoc": "true"
+}
+"@
+
+\$additionalAppSettings_Web = @"
+{
+    "AllowPwdReset": "True",
+    "UseSSL": "true",
+    "DefaultDomainName": "${Web_DefaultDomainName}",
+    "Port": "",
+    "Domain": "",
+    "ADUserId": "",
+    "ADPassword": "",
+    "CareConnect_InboxUrl": "${Web_CareConnect_InboxUrl}",
+    "CareConnect_InboxOAuthID": "${Web_CareConnect_InboxOAuthID}",
+    "URLScheme": "https",
+    "AcctMgmt_URL": "${Web_AcctMgmt_URL}",
+    "pwdchg_URL" : "${Web_pwdchg_URL}",
+    "Logging_MinimumSeverityLevel": "${Web_Logging_MinimumSeverityLevel}",
+    "DomainJoinSecretId": "${Web_DomainJoinSecretId}",
+    "DomainJoinOUPath" : "${Web_DomainJoinOUPath}"
+}
+"@
+
+\$additionalAppSettings_Guardiant = @"
+{
+    "DB_ApplicationName": "GuardiantSvc",
+    "Logging_AppName": "myUnity Guardiant Service",
+    "Logging_Directory": "/mnt/logs/guardiant",
+    "Logging_MinimumSeverityLevel": "${Guardiant_Logging_MinimumSeverityLevel}",
+    "ServiceHostCpuUnits" : "${ServiceHostCpuUnits}",
+    "ServiceHostMemoryMB" : "${ServiceHostMemoryMB}",
+    "ServiceScalingMinCapacity" : "${ServiceScalingMinCapacity}",
+    "ServiceScalingMaxCapacity" : "${ServiceScalingMaxCapacity}",
+    "ServiceScalingCpuTargetPercent" : "${ServiceScalingCpuTargetPercent}",
+    "ServiceScaleInCooldownSeconds" : "${ServiceScaleInCooldownSeconds}",
+    "ServiceScaleOutCooldownSeconds" : "${ServiceScaleOutCooldownSeconds}"
+}
+"@
+
+\$additionalAppSettings_HL7 = @"
+{
+    "TimerIntervalInSeconds": "${HL7_TimerIntervalInSeconds}",
+    "KeepRunning": "${HL7_KeepRunning}",
+    "DB_ApplicationName": "HL7Svc",
+    "Logging_AppName": "myUnity HL7 Service",
+    "Logging_Directory": "/mnt/logs/hl7",
+    "Logging_MinimumSeverityLevel": "${HL7_Logging_MinimumSeverityLevel}",
+    "ServiceHostCpuUnits" : "${ServiceHostCpuUnits}",
+    "ServiceHostMemoryMB" : "${ServiceHostMemoryMB}",
+    "ServiceScalingMinCapacity" : "${ServiceScalingMinCapacity}",
+    "ServiceScalingMaxCapacity" : "${ServiceScalingMaxCapacity}",
+    "ServiceScalingCpuTargetPercent" : "${ServiceScalingCpuTargetPercent}",
+    "ServiceScaleInCooldownSeconds" : "${ServiceScaleInCooldownSeconds}",
+    "ServiceScaleOutCooldownSeconds" : "${ServiceScaleOutCooldownSeconds}"
+}
+"@
+
+\$additionalAppSettings_InteropInbound = @"
+{
+    "CacheSettingsDuration": "${InteropInbound_CacheSettingsDuration}",
+    "ConfigurationWriteDelay": "${InteropInbound_ConfigurationWriteDelay}",
+    "DeVeroRefreshSettingsIntervalMilliseconds": "${InteropInbound_DeVeroRefreshSettingsIntervalMilliseconds}",
+    "DeVeroStopProcessingWaitTime": "${InteropInbound_DeVeroStopProcessingWaitTime}",
+    "EventLogging": "true",
+    "ReLoginInterval": "${InteropInbound_ReLoginInterval}",
+    "RePollInterval": "${InteropInbound_RePollInterval}",
+    "DB_ApplicationName": "InteropInboundSvc",
+    "Logging_AppName": "myUnity InteropInbound Service",
+    "Logging_Directory": "/mnt/logs/InteropInbound",
+    "Logging_MinimumSeverityLevel": "${InteropInbound_Logging_MinimumSeverityLevel}",
+    "ServiceHostCpuUnits" : "${ServiceHostCpuUnits}",
+    "ServiceHostMemoryMB" : "${ServiceHostMemoryMB}",
+    "ServiceScalingMinCapacity" : "${ServiceScalingMinCapacity}",
+    "ServiceScalingMaxCapacity" : "${ServiceScalingMaxCapacity}",
+    "ServiceScalingCpuTargetPercent" : "${ServiceScalingCpuTargetPercent}",
+    "ServiceScaleInCooldownSeconds" : "${ServiceScaleInCooldownSeconds}",
+    "ServiceScaleOutCooldownSeconds" : "${ServiceScaleOutCooldownSeconds}"
+}
+"@
+
+\$additionalAppSettings_InteropOutbound = @"
+{
+    "ReLoginInterval": "${InteropOutbound_ReLoginInterval}",
+    "RePollInterval": "${InteropOutbound_RePollInterval}",
+    "DB_ApplicationName": "InteropOutboundSvc",
+    "Logging_AppName": "myUnity InteropOutbound Service",
+    "Logging_Directory": "/mnt/logs/InteropOutbound",
+    "Logging_MinimumSeverityLevel": "${InteropOutbound_Logging_MinimumSeverityLevel}",
+    "TrackOrphanedConnections": "true",
+    "ServiceHostCpuUnits" : "${ServiceHostCpuUnits}",
+    "ServiceHostMemoryMB" : "${ServiceHostMemoryMB}",
+    "ServiceScalingMinCapacity" : "${ServiceScalingMinCapacity}",
+    "ServiceScalingMaxCapacity" : "${ServiceScalingMaxCapacity}",
+    "ServiceScalingCpuTargetPercent" : "${ServiceScalingCpuTargetPercent}",
+    "ServiceScaleInCooldownSeconds" : "${ServiceScaleInCooldownSeconds}",
+    "ServiceScaleOutCooldownSeconds" : "${ServiceScaleOutCooldownSeconds}"
+}
+"@
+
+\$additionalAppSettings_JobScheduler = @"
+{
+    "IterationCycle": "${JobScheduler_IterationCycle}",
+    "ThreadMultiplier": "1",
+    "EventLogging": "true",
+    "InfoLogging": "true",
+    "DB_ApplicationName": "JobSchedulerSvc",
+    "Logging_AppName": "myUnity JobScheduler Service",
+    "Logging_Directory": "/mnt/logs/JobScheduler",
+    "Logging_MinimumSeverityLevel": "${JobScheduler_Logging_MinimumSeverityLevel}",
+    "ServiceHostCpuUnits" : "${ServiceHostCpuUnits}",
+    "ServiceHostMemoryMB" : "${ServiceHostMemoryMB}",
+    "ServiceScalingMinCapacity" : "${ServiceScalingMinCapacity}",
+    "ServiceScalingMaxCapacity" : "${ServiceScalingMaxCapacity}",
+    "ServiceScalingCpuTargetPercent" : "${ServiceScalingCpuTargetPercent}",
+    "ServiceScaleInCooldownSeconds" : "${ServiceScaleInCooldownSeconds}",
+    "ServiceScaleOutCooldownSeconds" : "${ServiceScaleOutCooldownSeconds}"
+}
+"@
+
+\$additionalAppSettings_RemoteCommAgent = @"
+{
+    "AutoFixEnabled": "false",
+    "AutoFixEveryXSeconds": "60",
+    "AutoFixStopAfterXRetries": "1",
+    "DebugMode": "false",
+    "KeepRunning": "Yes",
+    "listening_SSLCertificate": "YES",
+    "LogErrorsToFile": "false",
+    "timer_Interval": "120000",
+    "TimerIntervalInSeconds": "60",
+    "write_log": "YES",
+    "DB_ApplicationName": "RemoteCommAgentSvc",
+    "Logging_AppName": "myUnity RemoteCommAgent Service",
+    "Logging_Directory": "/mnt/logs/RemoteCommAgent",
+    "Logging_MinimumSeverityLevel": "${RemoteCommAgent_Logging_MinimumSeverityLevel}",
+    "ServiceHostCpuUnits" : "${ServiceHostCpuUnits}",
+    "ServiceHostMemoryMB" : "${ServiceHostMemoryMB}",
+    "ServiceScalingMinCapacity" : "${ServiceScalingMinCapacity}",
+    "ServiceScalingMaxCapacity" : "${ServiceScalingMaxCapacity}",
+    "ServiceScalingCpuTargetPercent" : "${ServiceScalingCpuTargetPercent}",
+    "ServiceScaleInCooldownSeconds" : "${ServiceScaleInCooldownSeconds}",
+    "ServiceScaleOutCooldownSeconds" : "${ServiceScaleOutCooldownSeconds}"
+}
+"@
+
+\$additionalAppSettings_Telephony = @"
+{
+    "AutoFixEnabled": "false",
+    "AutoFixEveryXSeconds": "60",
+    "AutoFixStopAfterXRetries": "1",
+    "DebugMode": "false",
+    "LogErrorsToFile": "false",
+    "DB_ApplicationName": "TelephonySvc",
+    "Logging_AppName": "myUnity Telephony Service",
+    "Logging_Directory": "/mnt/logs/Telephony",
+    "Logging_MinimumSeverityLevel": "${Telephony_Logging_MinimumSeverityLevel}",
+    "ServiceHostCpuUnits" : "${ServiceHostCpuUnits}",
+    "ServiceHostMemoryMB" : "${ServiceHostMemoryMB}",
+    "ServiceScalingMinCapacity" : "${ServiceScalingMinCapacity}",
+    "ServiceScalingMaxCapacity" : "${ServiceScalingMaxCapacity}",
+    "ServiceScalingCpuTargetPercent" : "${ServiceScalingCpuTargetPercent}",
+    "ServiceScaleInCooldownSeconds" : "${ServiceScaleInCooldownSeconds}",
+    "ServiceScaleOutCooldownSeconds" : "${ServiceScaleOutCooldownSeconds}"
+}
+"@
+
+\$additionalAppSettings_Workflow = @"
+{
+    "TimerIntervalInSeconds": "30",
+    "KeepRunning": "Yes",
+    "DB_ApplicationName": "WorkflowSvc",
+    "Logging_AppName": "myUnity Workflow Service",
+    "Logging_Directory": "/mnt/logs/Workflow",
+    "Logging_MinimumSeverityLevel": "${Workflow_Logging_MinimumSeverityLevel}",
+    "ServiceHostCpuUnits" : "${ServiceHostCpuUnits}",
+    "ServiceHostMemoryMB" : "${ServiceHostMemoryMB}",
+    "ServiceScalingMinCapacity" : "${ServiceScalingMinCapacity}",
+    "ServiceScalingMaxCapacity" : "${ServiceScalingMaxCapacity}",
+    "ServiceScalingCpuTargetPercent" : "${ServiceScalingCpuTargetPercent}",
+    "ServiceScaleInCooldownSeconds" : "${ServiceScaleInCooldownSeconds}",
+    "ServiceScaleOutCooldownSeconds" : "${ServiceScaleOutCooldownSeconds}"
+}
+"@
+
+\$additionalAppSettings_OfflineMtf = @"
+{
+    "DB_ApplicationName": "OfflineMtfSvc",
+    "Logging_AppName": "myUnity Offline MTF Service",
+    "Logging_Directory": "/mnt/logs/OfflineMtf",
+    "Logging_MinimumSeverityLevel": "${OfflineMtf_Logging_MinimumSeverityLevel}",
+    "ServiceHostCpuUnits" : "${ServiceHostCpuUnits}",
+    "ServiceHostMemoryMB" : "${ServiceHostMemoryMB}",
+    "ServiceScalingMinCapacity" : "${ServiceScalingMinCapacity}",
+    "ServiceScalingMaxCapacity" : "${ServiceScalingMaxCapacity}",
+    "ServiceScalingCpuTargetPercent" : "${ServiceScalingCpuTargetPercent}",
+    "ServiceScaleInCooldownSeconds" : "${ServiceScaleInCooldownSeconds}",
+    "ServiceScaleOutCooldownSeconds" : "${ServiceScaleOutCooldownSeconds}"
+}
+"@
+
+function SaveParam {
+    param(
+        [Parameter(Mandatory=\$true)][String]\$name,
+        [Parameter(Mandatory=\$true)][String]\$value,
+        [Parameter(Mandatory=\$true)][String]\$valueAdditions
+    )
+
+    Write-Host "Saving Parameter: \$name";
+    
+    \$combinedValues = (ConvertTo-Json (MergeObjects (ConvertFrom-Json \$value) (ConvertFrom-Json \$valueAdditions)));
+
+    \$tags = @(
+        @{Key="CostCenter";Value="${cost_center}"},
+        @{Key="Application";Value="${Application}"},
+        @{Key="ResourceType";Value="${ResourceType}"}
+    );
+
+    Write-SSMParameter -Name \$name -Value \$combinedValues -Type "SecureString" -Tag \$tags
+}
+
+function MergeObjects {
+    param (
+        [Object] \$Object1,
+        [Object] \$Object2
+    )
+    \$Object = [ordered] @{}
+    foreach (\$Property in \$Object1.PSObject.Properties) {
+        \$Object += @{\$Property.Name = \$Property.Value}
+    }
+    foreach (\$Property in \$Object2.PSObject.Properties) {
+        \$Object += @{\$Property.Name = \$Property.Value}
+    }
+
+    return [pscustomobject] \$Object
+}
+
+function Main {
+    SaveParam -Name "/myUnity/Config/Stack_${StackID}/Web/1.0/json" -Value \$commonAppSettings -ValueAdditions \$additionalAppSettings_Web;
+    SaveParam -Name "/myUnity/Config/Stack_${StackID}/Guardiant/1.0/json" -Value \$commonAppSettings -ValueAdditions \$additionalAppSettings_Guardiant;
+    SaveParam -Name "/myUnity/Config/Stack_${StackID}/HL7/1.0/json" -Value \$commonAppSettings -ValueAdditions \$additionalAppSettings_HL7;
+    SaveParam -Name "/myUnity/Config/Stack_${StackID}/InteropInbound/1.0/json" -Value \$commonAppSettings -ValueAdditions \$additionalAppSettings_InteropInbound;
+    SaveParam -Name "/myUnity/Config/Stack_${StackID}/InteropOutbound/1.0/json" -Value \$commonAppSettings -ValueAdditions \$additionalAppSettings_InteropOutbound;
+    SaveParam -Name "/myUnity/Config/Stack_${StackID}/JobScheduler/1.0/json" -Value \$commonAppSettings -ValueAdditions \$additionalAppSettings_JobScheduler;
+    SaveParam -Name "/myUnity/Config/Stack_${StackID}/OfflineMtf/1.0/json" -Value \$commonAppSettings -ValueAdditions \$additionalAppSettings_OfflineMtf;
+    SaveParam -Name "/myUnity/Config/Stack_${StackID}/RemoteCommAgent/1.0/json" -Value \$commonAppSettings -ValueAdditions \$additionalAppSettings_RemoteCommAgent;
+    SaveParam -Name "/myUnity/Config/Stack_${StackID}/Telephony/1.0/json" -Value \$commonAppSettings -ValueAdditions \$additionalAppSettings_Telephony;
+    SaveParam -Name "/myUnity/Config/Stack_${StackID}/Workflow/1.0/json" -Value \$commonAppSettings -ValueAdditions \$additionalAppSettings_Workflow;
+}
+
+Main
+
+    """)
+}
+
+pipeline {
+    agent { label 'msbuild' }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '1'))
+    }
+    stages {
+        stage('clean-workspace') {
+            steps {
+                // Clean before build
+                cleanWs()
+            }
+        }
+        stage('checkout-source-code') {
+            // checkout from git
+            steps {
+                checkoutService("${git_repo}","${git_branch}")
+            }
+        }
+        stage('create-app-parameters') {
+            steps {
+                createResources()
+            }
+        }
+    }
+}

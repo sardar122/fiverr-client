@@ -1,0 +1,56 @@
+def checkoutService(gitRepo, gitBranch) {
+    //bitbucket account id from jenkins
+    def git_credentials_id = "bitbucket_bbcloudapi"
+    def gitBranchParameter = "${gitBranch}".toString()
+    checkout([$class: 'GitSCM',
+        branches: [[name: "${gitBranchParameter}"]],
+        doGenerateSubmoduleConfigurations: false,
+        submoduleCfg: [],
+        userRemoteConfigs: [[url: "https://bitbucket.org/ntsttech/${gitRepo}.git", credentialsId: "${git_credentials_id}"]],
+    ])
+}
+
+def cleanupWorkfilereploc(scriptName) {
+    def output = powershell(returnStdout: true, script: """
+        Using module \"${ENV:WORKSPACE}\\Powershell\\mubo_core.psm1\";
+
+        function Invoke-Cleanup {            
+            param ([Parameter(Mandatory=\$true)][string]\$BucketName)
+            & (Get-ScriptDirectory -PostPath \"${ENV:WORKSPACE}\\Powershell\\""" + scriptName + """\") `
+                -BucketName \$BucketName `
+        }
+
+        function Main {
+            Invoke-Cleanup -BucketName ${BucketName};
+        }
+
+        Main
+    """)
+    println output
+}
+
+pipeline {
+    agent { label 'msbuild' }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '1'))
+    }
+    stages {
+        stage('clean-workspace') {
+            steps {
+                // Clean before build
+                cleanWs()
+            }
+        }
+        stage('checkout-source-code') {
+            // checkout from git
+            steps {
+                checkoutService("${git_repo}","${git_branch}")
+            }
+        }
+        stage('cleanup-workfilereploc') {
+            steps {
+                cleanupWorkfilereploc('cleanup-workfilereploc.ps1')
+            }
+        }
+    }
+}

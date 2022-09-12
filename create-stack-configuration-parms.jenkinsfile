@@ -1,0 +1,152 @@
+import groovy.json.JsonSlurper
+
+if (env.JENKINS_URL.contains('myunity-bo-prod-jenkins')) {
+    cost_center = "2016 Hosting - Post Acute"
+} else if (env.JENKINS_URL.contains('myunity-bo-test-jenkins')) {
+    cost_center = "5027 RD - myUnity Homecare and Hospice"
+} else {
+    error("Unknown Jenkins instance... Exiting")
+}
+
+def checkoutService(gitRepo, gitBranch) {
+    //bitbucket account id from jenkins
+    def git_credentials_id = "bitbucket_bbcloudapi"
+    def gitBranchParameter = "${gitBranch}".toString()
+    checkout([$class: 'GitSCM',
+          branches: [[name: "${gitBranchParameter}"]],
+          doGenerateSubmoduleConfigurations: false,
+          submoduleCfg: [],
+          userRemoteConfigs: [[url: "https://bitbucket.org/ntsttech/${gitRepo}.git", credentialsId: "${git_credentials_id}"]],
+         ])
+}
+
+def createResources() {
+    powershell(returnStdout: true, script: """
+        
+        \$sp = [StackConfigParams]::new(
+            <# [String]\$stack_id #>'${StackID}',
+            <# [String]\$aws_region #>'${aws_region}',
+            <# [String[]]\$aws_security_group_fargate #>'${aws_security_group_fargate}',
+            <# [String]\$aws_role_ECS_Execution #>'${aws_role_ECS_Execution}',
+            <# [String]\$environment_type #>'${environment_type}',
+            <# [String]\$aws_vpc #>'${aws_vpc}',
+            <# [String[]]\$aws_public_subnets #>'${aws_public_subnets}',
+            <# [String[]]\$aws_private_subnets #>'${aws_private_subnets}',
+            <# [String]\$aws_load_balancer_cert_arn #>'${aws_load_balancer_cert_arn}',
+            <# [String[]]\$aws_elastic_load_balanced_security_group #>'${aws_elastic_load_balanced_security_group}',
+            <# [String[]]\$aws_app_security_group #>'${aws_app_security_group}',
+            <# [String[]]\$aws_bastion_host_security_group #>'${aws_bastion_host_security_group}',
+            <# [String]\$aws_web_app_bucket #>'${aws_web_app_bucket}',
+            <# [String]\$aws_web_help_bucket #>'${aws_web_help_bucket}',
+            <# [String]\$aws_web_crm_bucket #>'${aws_web_crm_bucket }',
+            <# [String]\$DB_Name #>'${DB_Name}'
+        );
+
+        
+        function SavePropertiesToParamStore {
+            param ([Parameter(Mandatory=\$true)][StackConfigParams]\$StackConfigParams)
+
+            \$paramName = "/myUnity/Config/Stack_\$(\$StackConfigParams.stack_id)/1.0/json";
+            \$paramValue = \$StackConfigParams | ConvertTo-Json;
+            \$tags = @(
+                @{Key="CostCenter";Value="${cost_center}"},
+                @{Key="Application";Value="${Application}"},
+                @{Key="ResourceType";Value="${ResourceType}"}
+            );
+
+            Write-SSMParameter -Name \$paramName -Value \$paramValue -Type "SecureString" -Tag \$tags
+        }
+        
+        function Main {
+            \$sp;
+            SavePropertiesToParamStore -StackConfigParams \$sp;
+            Write-SSMParameter -Name "/myUnity/Config/Stack_${StackID}/LastAppliedVersion" -Value "Init" -Type "String" -Overwrite \$true
+        }
+        
+        class StackConfigParams {
+            [ValidatePattern('^[tsp][1-9][0-9]*\$')][String]\$stack_id;
+            [ValidateSet('us-east-2')][String]\$aws_region;
+            [String[]]\$aws_security_group_fargate;
+            [String]\$aws_role_ECS_Execution;
+            [ValidateSet('dev','test','staging','uat','train','prod')][String]\$environment_type;
+            [String]\$aws_vpc;
+            [String[]]\$aws_public_subnets;
+            [String[]]\$aws_private_subnets;
+            [String]\$aws_load_balancer_cert_arn;
+            [String[]]\$aws_elastic_load_balanced_security_group;
+            [String[]]\$aws_app_security_group;
+            [String[]]\$aws_bastion_host_security_group;
+            [String]\$aws_web_app_bucket;
+            [String]\$aws_web_help_bucket;
+            [String]\$aws_web_crm_bucket;
+            [String]\$DB_Name;
+            
+            StackConfigParms () {
+            }
+        
+            StackConfigParams (
+                [String]\$stack_id,
+                [String]\$aws_region,
+                [String]\$aws_security_group_fargate,
+                [String]\$aws_role_ECS_Execution,
+                [String]\$environment_type,
+                [String]\$aws_vpc,
+                [String]\$aws_public_subnets,
+                [String]\$aws_private_subnets,
+                [String]\$aws_load_balancer_cert_arn,
+                [String]\$aws_elastic_load_balanced_security_group,
+                [String]\$aws_app_security_group,
+                [String]\$aws_bastion_host_security_group,
+                [String]\$aws_web_app_bucket,
+                [String]\$aws_web_help_bucket,
+                [String]\$aws_web_crm_bucket,
+                [String]\$DB_Name
+            ){
+                \$this.stack_id = \$stack_id;
+                \$this.aws_region = \$aws_region;
+                \$this.aws_security_group_fargate = \$aws_security_group_fargate.Replace(" ","").Split(",");
+                \$this.aws_role_ECS_Execution = \$aws_role_ECS_Execution;
+                \$this.environment_type = \$environment_type;
+                \$this.aws_vpc = \$aws_vpc;
+                \$this.aws_public_subnets = \$aws_public_subnets.Replace(" ","").Split(",");
+                \$this.aws_private_subnets = \$aws_private_subnets.Replace(" ","").Split(",");
+                \$this.aws_load_balancer_cert_arn = \$aws_load_balancer_cert_arn;
+                \$this.aws_elastic_load_balanced_security_group = \$aws_elastic_load_balanced_security_group.Replace(" ","").Split(",");
+                \$this.aws_app_security_group = \$aws_app_security_group.Replace(" ","").Split(",");
+                \$this.aws_bastion_host_security_group = \$aws_bastion_host_security_group.Replace(" ","").Split(",");
+                \$this.aws_web_app_bucket = \$aws_web_app_bucket;
+                \$this.aws_web_help_bucket = \$aws_web_help_bucket;
+                \$this.aws_web_crm_bucket = \$aws_web_crm_bucket;
+                \$this.DB_Name = \$DB_Name;
+            }
+        }
+
+        Main
+    """)
+}
+
+pipeline {
+    agent { label 'msbuild' }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '1'))
+    }
+    stages {
+        stage('clean-workspace') {
+            steps {
+                // Clean before build
+                cleanWs()
+            }
+        }
+        stage('checkout-source-code') {
+            // checkout from git
+            steps {
+                checkoutService("${git_repo}","${git_branch}")
+            }
+        }
+        stage('create-stack-config') {
+            steps {
+                createResources()
+            }
+        }
+    }
+}

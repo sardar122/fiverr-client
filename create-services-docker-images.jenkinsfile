@@ -1,0 +1,71 @@
+def pathInS3 = "BuildOutputs/${ParentBuildName}/${ParentBuildNumber}"
+def sourceFileName = "output.zip"
+
+pipeline {
+    agent { label 'Linux' }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '5'))
+        copyArtifactPermission("${ParentBuildName}");
+    }
+    stages {
+        stage('clean') {
+            steps {
+                // Clean before build
+                cleanWs()
+            }
+        }
+        stage("get-build-files-s3") {
+            steps {
+                withAWS(region: "${AWSRegion}", credentials: "${AWSProfile}") {
+                    echo "Getting content from S3 with AWS creds";
+                    s3Download(file: "${sourceFileName}", bucket: "${AWSS3Bucket}", path: "${pathInS3}/${sourceFileName}", force: true)
+                    unzip dir: 'a', glob: '', zipFile: "${sourceFileName}"
+                }
+            }
+        }
+        stage('build-docker-images') {
+            steps {
+                script{
+
+                    //remove images
+                    sh "docker system prune -a -f"
+
+                    //build the images
+                    String tag = "${ParentBuildName}-${ParentBuildNumber}".replaceAll(~/\s/, "").replaceAll(~/[()]/, "");//remove spaces and parenthesis.
+                                        
+                    docker.withRegistry("${DockerRegistryURL}", "ecr:${AWSRegion}:${AWSProfile}") {
+
+                        // build images
+                        def guardiant = docker.build("myunity-bo-svc-guardiant_collector:${tag}", "--rm --build-arg buildOut=. -f \"a/Source/Deploy/Docker/Guardiant/Dockerfile\" \"a/Components/Guardiant\"");
+                        def hl7 = docker.build("myunity-bo-svc-hl7:${tag}", "--rm --build-arg buildOut=. -f \"a/Source/Deploy/Docker/HL7/Dockerfile\" \"a/Components/HL7\"");
+                        def interopInbound = docker.build("myunity-bo-svc-interop_inbound:${tag}", "--rm --build-arg buildOut=. -f \"a/Source/Deploy/Docker/InteropInbound/Dockerfile\" \"a/Components/Interop\"");
+                        def interopOutbound = docker.build("myunity-bo-svc-interop_outbound:${tag}", "--rm --build-arg buildOut=. -f \"a/Source/Deploy/Docker/InteropOutbound/Dockerfile\" \"a/Components/Interop\"");
+                        def jobScheduler = docker.build("myunity-bo-svc-job_scheduler:${tag}", "--rm --build-arg buildOut=. -f \"a/Source/Deploy/Docker/JobScheduler/Dockerfile\" \"a/Components/JobSchedulerCmd\"");
+                        def remoteComm = docker.build("myunity-bo-svc-remote_comm_agent:${tag}", "--rm --build-arg buildOut=. -f \"a/Source/Deploy/Docker/Remote Comm Agent/Dockerfile\" \"a/Components/Remote Comm Agent\"");
+                        def telephony = docker.build("myunity-bo-svc-telephony:${tag}", "--rm --build-arg buildOut=. -f \"a/Source/Deploy/Docker/Telephony/Dockerfile\" \"a/Components/Telephony\"");
+                        def workflow = docker.build("myunity-bo-svc-workflow:${tag}", "--rm --build-arg buildOut=. -f \"a/Source/Deploy/Docker/Workflow/Dockerfile\" \"a/Components/Workflow\"");
+                        def audit = docker.build("myunity-bo-svc-audit:${tag}", "--rm --build-arg buildOut=. -f \"a/Source/Deploy/Docker/AuditService/Dockerfile\" \"a/Components/AuditService\"");
+                        def offlineMtf = docker.build("myunity-bo-svc-offline_mtf:${tag}", "--rm --build-arg buildOut=. -f \"a/Source/Deploy/Docker/OfflineMtf/Dockerfile\" \"a/Components/OfflineMtfService\"");
+                        def filebeat = docker.build("myunity-bo-svc-filebeat:${tag}", "--rm -f \"a/Source/Deploy/Docker/Filebeat/Dockerfile\" \"a/Source/Deploy/Docker/Filebeat\"");
+
+                        if (UploadToECR.toBoolean()) {
+                            //push images with build tag
+                            guardiant.push()
+                            hl7.push()
+                            interopInbound.push()
+                            interopOutbound.push()
+                            jobScheduler.push()
+                            remoteComm.push()
+                            telephony.push()
+                            workflow.push()
+                            audit.push()
+                            offlineMtf.push()
+                            filebeat.push()
+
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

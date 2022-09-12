@@ -1,0 +1,304 @@
+#!/usr/bin/env groovy
+
+import groovy.json.JsonSlurper
+
+if (env.JENKINS_URL.contains('myunity-bo-prod-jenkins')) {
+    environmentA = "prod"
+    environmentB = "uat"
+}
+
+else if (env.JENKINS_URL.contains('myunity-bo-test-jenkins')){
+    environmentA = "qa"
+    environmentB = "dev"
+}
+else{
+    error("Unknown Jenkins instance... Exiting")
+}
+
+
+def checkoutService(gitRepo, gitBranch) {
+    //bitbucket account id from jenkins
+    def git_credentials_id = "bitbucket_bbcloudapi"
+    def gitBranchParameter = "${gitBranch}".toString()
+    checkout([$class: 'GitSCM',
+          branches: [[name: "${gitBranchParameter}"]],
+          doGenerateSubmoduleConfigurations: false,
+          submoduleCfg: [],
+          userRemoteConfigs: [[url: "https://bitbucket.org/ntsttech/${gitRepo}.git", credentialsId: "${git_credentials_id}"]],
+    ])
+}
+
+node(label: 'msbuild'){
+    def workspace = "${env.WORKSPACE}"
+    def cfn_repo = "${workspace}\\cfn"
+
+    // checkout from git
+    stage("checkout-tools"){
+        dir("${cfn_repo}"){
+            checkoutService("mubo-devops","master")
+        }
+    }
+
+    stage("gather-info"){
+        dir("${cfn_repo}"){
+            if ("${environment}" == "prod"){
+                prefix = "${environmentA}"
+                resource_name_prefix = "p"
+            }
+            else{
+                prefix = "${environmentB}"
+                resource_name_prefix = "t"
+            }
+
+            service = "myunity"
+            ec2_cfn_stack_name   = "${prefix}-ec2-crm"
+            ec2_instance_id = bat (script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} ${ec2_cfn_stack_name} Ec2Instance",returnStdout: true).trim()
+        }
+    }
+    servicedeploy:{
+        stage("deploy-service"){
+            echo "Deploying CRM HL7 Update"
+            dir("${cfn_repo}"){
+                psCommands = '''
+                    function Stop-Services {
+                        param(
+                            [Parameter(Mandatory=$true)][array]$enterprises
+                        )
+
+                        foreach ($enterpriseSys in $enterprises) {
+                            $serviceName = "CRMHL7_${enterpriseSys}"
+
+                            try {
+                                $service = Get-Service -Name $serviceName
+                            } catch {
+                                $service = ""
+                                Write-Host "No service named ${serviceName} exists. This service will be created."
+                            }
+
+                            if ($service.Length -ne 0) {
+                                Write-Output "Stopping service: ${serviceName}"
+                                Stop-Service -Name $serviceName
+                            }
+                        }
+                    }
+
+                    function Get-Latest {
+                        param(
+                            [Parameter(Mandatory=$true)][String]$hl7ServicePath,
+                            [Parameter(Mandatory=$true)][String]$bucketName,
+                            [Parameter(Mandatory=$true)][String]$bucketPath
+                        )
+
+                        $zipFileName = [System.IO.Path]::GetFileName($bucketPath)
+                        $zipFileFullPath = "${hl7ServicePath}\\\\${zipFileName}"
+
+                        if (-not [System.IO.File]::Exists($zipFileFullPath)) {
+                            Write-Output "No existing HL7 Service detected that matches configured file. Downloading from S3..."
+                            Read-S3Object -BucketName $bucketName -Key $bucketPath -File $zipFileFullPath
+                        }
+
+                        Write-Output "Expanding zip archive..."
+                        Expand-Archive $zipFileFullPath -DestinationPath $hl7ServicePath -Force
+                    }
+
+                    function Create-Enterprise-Directories {
+                        param(
+                            [Parameter(Mandatory=$true)][int]$enterpriseSys,
+                            [Parameter(Mandatory=$true)][String]$fileshare,
+                            [Parameter(Mandatory=$true)][String]$enterpriseInstallPath,
+                            [Parameter(Mandatory=$true)][String]$hl7ServicePath,
+                            [Parameter(Mandatory=$true)][String]$exePath,
+                            [Parameter(Mandatory=$true)][String]$configPath
+                        )
+
+                        $basePath = "${fileshare}\\\\enterprises\\\\${enterpriseSys}\\\\CRM"
+                        $deployedExePath = "${hl7ServicePath}\\\\HL7Exchange.exe"
+
+                        #these directories are not created by the service, and the service will fail if they do not exist
+                        Write-Output "${enterpriseSys}: Creating directories if not existing for HL7 and Documents in fileshare: ${basePath}"
+                        [System.IO.Directory]::CreateDirectory("${basePath}\\\\Export")
+                        [System.IO.Directory]::CreateDirectory("${basePath}\\\\Documents")
+                        [System.IO.Directory]::CreateDirectory("${basePath}\\\\Import")
+                        [System.IO.Directory]::CreateDirectory("${basePath}\\\\Import\\\\log")
+                        [System.IO.Directory]::CreateDirectory("${basePath}\\\\Import\\\\Process")
+                        [System.IO.Directory]::CreateDirectory("${basePath}\\\\Import\\\\Rejected")
+
+                        Write-Output "${enterpriseSys}: Creating directory and files for HL7 service..."
+                        [System.IO.Directory]::CreateDirectory($enterpriseInstallPath)
+                        [System.IO.File]::Copy($deployedExePath, $exePath, $true)
+                        [System.IO.File]::Copy("${hl7ServicePath}\\\\HL7Exchange.exe.config", $configPath, $true)
+
+                    }
+
+                    function Get-ConnectionStrings {
+                        param(
+                            [Parameter(Mandatory=$true)][int]$enterpriseSys
+                        )
+                        
+                        $enterpriseSysStr = $enterpriseSys.ToString()
+                        $npcId = $enterpriseSysStr.Substring(0, $enterpriseSysStr.Length - 3)
+                        $envIndicator = $enterpriseSysStr.SubString($enterpriseSysStr.Length - 3, 3)
+
+                        if ($envIndicator -eq "001") { $env = "live" }
+                        elseif ($envIndicator -eq "002") { $env = "train" }
+                        elseif ($envIndicator -eq "003") { $env = "uat" }
+                        elseif ($envIndicator -eq "004") { $env = "dev" }
+                        elseif ($envIndicator -eq "005") { $env = "upg" }
+
+                        if ($envIndicator -eq "001") { $prod = "prod" }
+                        else { $prod = "nonprod" }
+
+                        Write-Output "${enterpriseSys}: Loading configuration values for connection strings..."
+                        $param = Get-SSMParameter -Name "/myUnity/v2/${npcId}/client_json" -WithDecryption $true
+                        $paramVal = $param.Value | ConvertFrom-Json
+
+                        $dbHost = $paramVal.environments."$env".database_host
+                        $oltpDB = "MUE_${enterpriseSys}_${prod}_OLTP"
+                        $crmDB = "MUE_${enterpriseSys}_${prod}_CRM"
+
+                        $param = Get-SSMParameter -Name "/myUnity/v2/${npcId}/client_credentials_json" -WithDecryption $true
+                        $paramVal = $param.Value | ConvertFrom-Json
+
+                        $uid = $paramVal."$prod".app_sql_account.username
+                        $pwd = $paramVal."$prod".app_sql_account.password
+
+                        $conn = @{}
+                        $conn.OLTP = "Data Source=${dbHost};Initial Catalog=${oltpDB};Persist Security Info=True;User ID=${uid};Password=${pwd}"
+                        $conn.CRM = "Data Source=${dbHost};Initial Catalog=${crmDB};Persist Security Info=True;User ID=${uid};Password=${pwd}"
+
+                        return $conn
+                    }
+
+                    function Set-ConnectionStrings {
+                        param(
+                            [Parameter(Mandatory=$true)][string]$configPath,
+                            [Parameter(Mandatory=$true)][object]$connStrings
+                        )
+                        
+                        $config = New-Object XML
+                        $config.Load($configPath)
+                            
+                        foreach ($connStr in $config.configuration.connectionStrings.add) {
+                            if ($connStr.name -eq "CRMSys") {
+                                $connStr.connectionString = $connStrings.CRM
+                            } elseif ($connStr.name -eq "CareMEDX") {
+                                $connStr.connectionString = $connStrings.OLTP
+                            }
+                        }
+
+                        $config.Save($configPath)
+                    }
+
+                    function Encrypt-ConnectionStrings {
+                        param(
+                            [Parameter(Mandatory=$true)][string]$configPath
+                        )
+
+                        $executablePath = $configPath.Replace(".config", "")
+
+                        $aspConfig = [System.Configuration.ConfigurationManager]::OpenExeConfiguration($executablePath)
+                        $section = $aspConfig.GetSection("connectionStrings")
+                        $section.SectionInformation.ProtectSection("DataProtectionConfigurationProvider")
+                        $section.SectionInformation.ForceSave = $true
+                        $aspConfig.Save([System.Configuration.ConfigurationSaveMode]::Full)
+                    }
+
+                    function Create-Start-Service {
+                        param(
+                            [Parameter(Mandatory=$true)][int]$enterpriseSys,
+                            [Parameter(Mandatory=$true)][string]$serviceName,
+                            [Parameter(Mandatory=$true)][string]$exePath
+                        )
+                    
+                        try {
+                            $service = Get-Service -Name $serviceName
+                        } catch {
+                            Write-Output "Creating service: ${serviceName}"
+                            New-Service -Name $serviceName `
+                                -BinaryPathName $exePath `
+                                -DisplayName "CRM HL7 ${enterpriseSys}" `
+                                -Description "CRM HL7 Service for Enterprise ${enterpriseSys}" 
+
+                            $service = Get-Service -Name $serviceName
+                        }
+
+                        Write-Output "${enterpriseSys}: Starting service: ${serviceName}"
+                        Start-Service -Name $serviceName
+                    }
+
+                    function Process-Enterprise {
+                        param(
+                            [Parameter(Mandatory=$true)][int]$enterpriseSys,
+                            [Parameter(Mandatory=$true)][string]$hl7ServicePath,
+                            [Parameter(Mandatory=$true)][string]$fileshare
+                        )
+
+                        Write-Output "${enterpriseSys}: Processing..."
+                        $serviceName = "CRMHL7_${enterpriseSys}"    
+                        $enterpriseInstallPath = "${hl7ServicePath}\\\\${enterpriseSys}"
+                        $exePath = "${enterpriseInstallPath}\\\\HL7Exchange.exe"
+                        $configPath = "${enterpriseInstallPath}\\\\HL7Exchange.exe.config"
+
+                        Create-Enterprise-Directories `
+                            -enterpriseSys $enterpriseSys `
+                            -fileshare $fileshare `
+                            -enterpriseInstallPath $enterpriseInstallPath `
+                            -hl7ServicePath $hl7ServicePath `
+                            -exePath $exePath `
+                            -configPath $configPath
+
+                        Write-Output "${enterpriseSys}: Configure Connection Strings..."
+                        $connStrings = Get-ConnectionStrings -enterpriseSys $enterpriseSys
+
+                        Write-Output "${enterpriseSys}: Updating connection strings in the XML config..."
+                        Set-ConnectionStrings -configPath $configPath -connStrings $connStrings
+
+                        Write-Output "${enterpriseSys}: Encrypting connection strings..."
+                        Encrypt-ConnectionStrings -configPath $configPath
+
+                        Create-Start-Service -enterpriseSys $enterpriseSys -serviceName $serviceName -exePath $exePath
+                    }
+
+                    $hl7ServicePath = "C:\\\\Program Files (x86)\\\\CRMHL7Service"
+                    $bucketName = "''' + bucketName + '''"
+                    $bucketPath = "''' + bucketPath + '''"
+                    $enterprises = @(''' + enterprises + ''')
+                    $fileshare = "''' + shareLocation + '''"
+
+                    $ErrorActionPreference = "Stop"
+
+                    Stop-Services -enterprises $enterprises
+                    Get-Latest -hl7ServicePath $hl7ServicePath -bucketName $bucketName -bucketPath $bucketPath
+
+                    foreach($enterpriseSys in $enterprises) {
+                        Process-Enterprise `
+                            -enterpriseSys $enterpriseSys `
+                            -hl7ServicePath $hl7ServicePath `
+                            -fileshare $fileshare
+                    } 
+                '''
+
+                powershell '''\
+                    $runPSCommand = Send-SSMCommand `
+                        -InstanceId "''' + ec2_instance_id + '''" `
+                        -DocumentName "AWS-RunPowerShellScript" `
+                        -Parameter @{'commands' = ' ''' + psCommands + ''' '}
+
+                    do {  
+                            Start-Sleep -Seconds 5;      
+                            $return = Get-SSMCommandInvocation `
+                                -CommandId $runPSCommand.CommandId `
+                                -Details $true `
+                                -InstanceId ''' + ec2_instance_id + ''' | Select-Object -ExpandProperty CommandPlugins
+                        } while ($return.ResponseCode -eq -1)                    
+
+                    Write-Host "Command Status: $($return.Status)"
+                    Write-Host "Command Output: $($return.Output)"
+                    if ($return.ResponseCode -ne 0) {
+                        Write-Error "An error occurred while deploying CRM HL7 services."
+                    }        
+                '''.stripIndent() 
+            }
+        }
+    }
+}

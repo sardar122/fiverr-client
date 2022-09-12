@@ -1,0 +1,93 @@
+#!/usr/bin/env groovy
+import groovy.json.JsonSlurper
+if (env.JENKINS_URL.contains('myunity-bo-prod-jenkins')) {
+    environmentA = "prod"
+    environmentB = "uat"
+    cost_center  = "2016 Hosting - Post Acute"
+}
+else if (env.JENKINS_URL.contains('myunity-bo-test-jenkins')){
+    environmentA = "qa"
+    environmentB = "dev"
+    cost_center  = "5027 RD - myUnity Homecare and Hospice"
+}
+else{
+    error("Unknown Jenkins instance... Exiting")
+}
+
+def checkoutService(gitRepo, gitBranch) {
+    //bitbucket account id from jenkins
+    def git_credentials_id = "bitbucket_bbcloudapi"
+    def gitBranchParameter = "${gitBranch}".toString()
+    checkout([$class: 'GitSCM',
+          branches: [[name: "${gitBranchParameter}"]],
+          doGenerateSubmoduleConfigurations: false,
+          submoduleCfg: [],
+          userRemoteConfigs: [[url: "https://bitbucket.org/ntsttech/${gitRepo}.git", credentialsId: "${git_credentials_id}"]],
+    ])
+}
+
+node(label: 'msbuild'){
+    def workspace = "${env.WORKSPACE}"
+    def cfn_repo = "${workspace}\\cfn"
+
+    // checkout from git
+    stage("checkout-tools"){
+        dir("${cfn_repo}"){
+            checkoutService("mubo-devops","master")
+        }
+    }
+
+    stage("gather-info"){
+        dir("${cfn_repo}"){
+            if ("${environment}" == "prod"){
+                prefix = "${environmentA}"
+                resource_name_prefix = "p"
+            }
+            else{
+                prefix = "${environmentB}"
+                resource_name_prefix = "t"
+            }
+
+            service              = "myunity"
+            fsx_cfn_stack_name   = "${prefix}-fsx-crm-multitenant"
+            vpc_id               = bat (script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} ${service}-${prefix}-vpc VpcId",returnStdout: true).trim()
+
+            sg_fsx_cfn_stack_name = "sg-crm-fsx-${prefix}"
+            fsx_sg_arn = bat (script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} ${sg_fsx_cfn_stack_name} CRMFSxSecurityGroup",returnStdout: true).trim()
+            echo "FSx SecurityGroup ID: ${fsx_sg_arn}"
+
+            subnet_info = bat (script: "@powershell aws ec2 describe-subnets --filters \"Name=vpc-id,Values=${vpc_id} Name=availability-zone,Values=${Region}${az} Name=tag:Name,Values=${service}-${prefix}-private-${Region}${az}\"",returnStdout: true).trim()
+            def jsonSlurper = new JsonSlurper()
+            def object = jsonSlurper.parseText(subnet_info)
+            crm_fsx_subnet_id = object.Subnets.SubnetId[0]
+            echo "AZ:${Region}${az}     Subnet Name: ${service}-${prefix}-rds-${Region}${az}     Subnet ID: ${crm_fsx_subnet_id}"
+        }
+    }
+
+    stage("deploy-fsx"){
+        dir("${cfn_repo}"){
+            powershell """\
+                aws cloudformation deploy `
+                --no-fail-on-empty-changeset `
+                --stack-name \"${fsx_cfn_stack_name}\" `
+                --template-file \"cloudformation\\30-DataPersistance\\fsx-windows.yaml\" `
+                --capabilities CAPABILITY_IAM `
+                --region ${Region} `
+                --parameter-overrides `
+                \"DeploymentType=SINGLE_AZ_1\" `
+                \"StorageType=SSD\" `
+                \"Environment=${prefix}\" `
+                \"StorageCapacity=32\" `
+                \"ThroughputCapacity=8\" `
+                \"ActiveDirectoryId=${ActiveDirectoryId}\" `
+                \"FileSystemSecurityGroup=${fsx_sg_arn}\" `
+                \"AutomaticBackupRetentionDays=7\" `
+                \"SubnetIds=${crm_fsx_subnet_id}\" `
+                \"ResourceName=${resource_name_prefix}crm_fsx\" `
+                \"AWSBackupRetention=full\" `
+                \"CostCenter=${cost_center}\" `
+                \"ResourceType=Application\" `
+                \"Application=${service}\"""".stripIndent()
+        }
+    }
+}

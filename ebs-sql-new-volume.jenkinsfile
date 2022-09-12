@@ -1,0 +1,99 @@
+#!/usr/bin/env groovy
+if (env.JENKINS_URL.contains('myunity-bo-prod-jenkins')) {
+    environmentA = "prod"
+    environmentB = "uat"
+    cost_center  = "2016 Hosting - Post Acute"
+}
+else if (env.JENKINS_URL.contains('myunity-bo-test-jenkins')){
+    environmentA = "qa"
+    environmentB = "dev"
+    cost_center  = "5027 RD - myUnity Homecare and Hospice"
+}
+else{
+    error("Unknown Jenkins instance... Exiting")
+}
+
+def checkoutService(gitRepo, gitBranch) {
+    //bitbucket account id from jenkins
+    echo "Pulling source repo: ${gitRepo}"
+    echo "Branch: ${gitBranch}"
+    def git_credentials_id = "bitbucket_bbcloudapi"
+    def gitBranchParameter = "${gitBranch}".toString()
+    checkout([$class: 'GitSCM',
+          branches: [[name: "${gitBranchParameter}"]],
+          doGenerateSubmoduleConfigurations: false,
+          submoduleCfg: [],
+          userRemoteConfigs: [[url: "https://bitbucket.org/ntsttech/${gitRepo}.git", credentialsId: "${git_credentials_id}"]],
+    ])
+    ecs_hash = bat (script: "@git rev-parse --short HEAD",returnStdout: true).trim()
+    return ecs_hash
+}
+
+node(label: 'msbuild'){
+    def workspace = "${env.WORKSPACE}"
+    def cfn_repo = "${workspace}\\cfn"
+
+    // checkout from git
+    stage("checkout-tools"){
+        dir("${cfn_repo}"){
+            checkoutService("mubo-devops", scm.branches[0].name)
+        }
+    }
+
+    stage("deploy-ebs"){
+        dir("${cfn_repo}"){
+            if ("${environment}" == "prod"){
+                prefix = "${environmentA}"
+                resource_name_prefix = "p"
+            }
+            else{
+                prefix = "${environmentB}"
+                resource_name_prefix = "t"
+            }
+            l_clusterId = "${ClusterID}".toLowerCase()
+
+            service = "myunity"
+            ebs_cfn_stack_name      = "${prefix}-ec2-mssql-ebs-${ClientId}-${DriveNumber}"
+            ec2_cfn_stack_name      = "${prefix}-ec2-mssql-instance-multitenant-${l_clusterId}-${ServerNumber}"
+            ec2_instance_id         = bat (script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} ${ec2_cfn_stack_name} Ec2Instance",returnStdout: true).trim()
+            ec2_availability_zone   = bat (script: "@python \"${cfn_repo}\"\\Python\\get_cfnstack_output_value_by_key.py ${Region} ${ec2_cfn_stack_name} Ec2AvailabilityZone",returnStdout: true).trim()
+        }
+        dir("${cfn_repo}"){
+            powershell """\
+                aws cloudformation deploy `
+                --no-fail-on-empty-changeset `
+                --stack-name \"${ebs_cfn_stack_name}\" `
+                --template-file \"cloudformation\\40-Compute\\ec2-ebs-volume.yaml\" `
+                --capabilities CAPABILITY_IAM `
+                --region ${Region} `
+                --parameter-overrides `
+                \"Application=${service}\" `
+                \"AvailabilityZone=${ec2_availability_zone}\" `
+                \"Environment=${prefix}\" `
+                \"CostCenter=${cost_center}\" `
+                \"Client=${ClientLongName}\" `
+                \"ClientId=${ClientId}\" `
+                \"ResourceName=${resource_name_prefix}v${ClientId}muemdbw-client-drive-${DriveNumber}\" `
+                \"ResourceType=Application\" `
+                \"Ec2InstanceId=${ec2_instance_id}\" `
+                \"VolumeSize=${DriveSize}\" `
+                \"VolumeType=${DriveType}\" `
+                \"DriveLabel=${DriveLabel}\" `
+                \"DeviceName=${DriveLetter}\" `
+                \"DrivePartitionStyle=GPT\" `
+                \"DriveAllocationUnitSize=65536\" `
+                \"Iops=${Iops}\" `
+                \"Throughput=${Throughput}\" `
+                \"Device=xvd${DriveLetter.toLowerCase()}\" `
+                \"DeletionPolicy=Snapshot\"""".stripIndent()
+        }
+    }
+    stage('mount-drive') {
+        dir("${cfn_repo}"){
+            powershell(returnStdout: true, script: """Powershell\\ebs-sql-mount-tenant-drive.ps1 `
+                -ec2_instance_id "${ec2_instance_id}" `
+                -DriveLetter "${DriveLetter}" `
+                -DriveLabel "${DriveLabel}" """);
+        }
+    }
+}

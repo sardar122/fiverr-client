@@ -1,0 +1,28 @@
+pipeline {
+    agent { label 'msbuild' }
+    stages {
+        stage('swap-elbs-front-back-stack') {
+            steps {
+                script {
+                    powershell(returnStdout: true, script: """
+
+                        \$eb_application = Get-EBApplication | Where-Object { \$_.ApplicationName -like \"*-${StackID}-app*\" };
+                        \$eb_back_environment_stack = Get-EBEnvironment `
+                            -ApplicationName \$eb_application.ApplicationName `
+                            | Where-Object { \$_.Status -ne 'Terminated' -and \$_.CNAME -like \"*-${StackID}-back*\" };
+                        \$eb_front_environment_stack = Get-EBEnvironment `
+                            -ApplicationName \$eb_application.ApplicationName `
+                            | Where-Object { \$_.Status -ne 'Terminated' -and \$_.CNAME -like \"*-${StackID}-front*\" };
+            
+                        #flip back to front
+                        Set-EBEnvironmentCNAME `
+                            -DestinationEnvironmentId \$eb_back_environment_stack.EnvironmentId `
+                            -DestinationEnvironmentName \$eb_back_environment_stack.EnvironmentName `
+                            -SourceEnvironmentId \$eb_front_environment_stack.EnvironmentId `
+                            -SourceEnvironmentName \$eb_front_environment_stack.EnvironmentName;            
+                    """);
+                }
+            }
+        }
+    }
+}

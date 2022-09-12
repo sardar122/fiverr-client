@@ -1,0 +1,10 @@
+pipeline {
+    agent { label 'msbuild' }
+    stages {
+        stage('Scale Redis') {
+            steps {
+                bat "python Python/scale_redis.py ${region} ${cluster_name} ${shard_change_count}"
+            }
+        }
+    }
+}

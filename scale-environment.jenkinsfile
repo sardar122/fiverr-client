@@ -1,0 +1,10 @@
+pipeline {
+    agent { label 'msbuild' }
+    stages {
+        stage('Scale Environment') {
+            steps {
+                bat "python Python/scale_stack.py ${region} ${stack_name} ${environment_type} ${target_env} ${scale_amount} \"${schedule_name}\" \"${start_time}\" \"${end_time}\" \"${recurrence}\""
+            }
+        }
+    }
+}
